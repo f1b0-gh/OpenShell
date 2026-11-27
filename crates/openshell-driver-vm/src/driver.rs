@@ -23,8 +23,8 @@ use crate::rootfs::{
     ext4_image_has_directory, extract_host_supervisor, extract_rootfs_archive_to,
     prepare_sandbox_rootfs_from_image_root, recover_rootfs_image, remove_rootfs_image_file,
     sandbox_guest_init_path, sandbox_guest_runtime_identity, sandbox_guest_user_ids_from_image,
-    sandbox_guest_user_ids_from_overlay_image, set_rootfs_image_file_mode,
-    validate_host_supervisor, write_rootfs_image_file,
+    sandbox_guest_user_ids_from_legacy_image, sandbox_guest_user_ids_from_overlay_image,
+    set_rootfs_image_file_mode, validate_host_supervisor, write_rootfs_image_file,
 };
 use crate::runtime::VmBackend;
 use bollard::Docker;
@@ -6189,15 +6189,18 @@ async fn sandbox_owner_state_for_launch(
         if let Some((uid, gid)) = configured_sandbox_identity(config) {
             return Ok((SandboxOwnerIdentity { uid, gid }, true));
         }
-        return sandbox_owner_identity_from_image(owner_source_disk)
-            .await
-            .map(|identity| (identity, true));
+        return sandbox_owner_identity_from_image(
+            owner_source_disk,
+            OverlayPreparation::PreserveExisting,
+        )
+        .await
+        .map(|identity| (identity, true));
     }
 
     if let Some((uid, gid)) = configured_sandbox_identity(config) {
         return Ok((SandboxOwnerIdentity { uid, gid }, true));
     }
-    sandbox_owner_identity_from_image(owner_source_disk)
+    sandbox_owner_identity_from_image(owner_source_disk, OverlayPreparation::Fresh)
         .await
         .map(|identity| (identity, true))
 }
@@ -6217,7 +6220,12 @@ async fn persisted_sandbox_owner_identity(
     if !prior_identity.is_empty() {
         let prior_disk = image_cache_rootfs_image(&config.state_dir, prior_identity.trim());
         if tokio::fs::metadata(&prior_disk).await.is_ok() {
-            match sandbox_owner_identity_from_image(&prior_disk).await {
+            match sandbox_owner_identity_from_image(
+                &prior_disk,
+                OverlayPreparation::PreserveExisting,
+            )
+            .await
+            {
                 Ok(identity) => return Ok(Some(identity)),
                 Err(error) => warn!(
                     image_path = %prior_disk.display(),
@@ -6262,12 +6270,17 @@ async fn read_persisted_workload_identity(
 
 async fn sandbox_owner_identity_from_image(
     image_path: &Path,
+    preparation: OverlayPreparation,
 ) -> Result<SandboxOwnerIdentity, String> {
     let image_path = image_path.to_path_buf();
-    let identity =
-        tokio::task::spawn_blocking(move || sandbox_guest_user_ids_from_image(&image_path))
-            .await
-            .map_err(|error| format!("read sandbox identity task failed: {error}"))??;
+    let identity = tokio::task::spawn_blocking(move || match preparation {
+        OverlayPreparation::Fresh => sandbox_guest_user_ids_from_image(&image_path),
+        OverlayPreparation::PreserveExisting => {
+            sandbox_guest_user_ids_from_legacy_image(&image_path)
+        }
+    })
+    .await
+    .map_err(|error| format!("read sandbox identity task failed: {error}"))??;
     let (uid, gid) = identity.unwrap_or((DEFAULT_SANDBOX_UID, DEFAULT_SANDBOX_UID));
     validate_sandbox_owner_identity(uid, gid)?;
     Ok(SandboxOwnerIdentity { uid, gid })
@@ -9164,6 +9177,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn existing_overlay_image_lookup_preserves_legacy_identity_contract() {
+        for (layout, prepared, outer_account) in [
+            ("legacy", false, true),
+            ("prepared", true, true),
+            ("prepared-without-outer-account", true, false),
+        ] {
+            for legacy_marker in [false, true] {
+                for persisted_image in [false, true] {
+                    let directory = tempfile::tempdir().unwrap();
+                    let root = directory.path();
+                    let state = root.join("sandboxes/existing");
+                    std::fs::create_dir_all(&state).unwrap();
+                    if legacy_marker {
+                        std::fs::write(
+                            state.join(SANDBOX_OWNER_STATE_FILE),
+                            format!("{SANDBOX_OWNER_STATE_V1}\n"),
+                        )
+                        .unwrap();
+                    }
+                    let image_identity = "prepared-identity:sha256:legacy";
+                    if persisted_image {
+                        std::fs::write(state.join(IMAGE_IDENTITY_FILE), image_identity).unwrap();
+                    }
+                    let source = root.join("image-source");
+                    std::fs::create_dir_all(&source).unwrap();
+                    if outer_account {
+                        std::fs::create_dir_all(source.join("etc")).unwrap();
+                        std::fs::write(
+                            source.join("etc/passwd"),
+                            "sandbox:x:1000:1000:Sandbox:/sandbox:/bin/sh\n",
+                        )
+                        .unwrap();
+                    }
+                    if prepared {
+                        std::fs::create_dir_all(source.join("image-rootfs/etc")).unwrap();
+                        std::fs::write(
+                            source.join("image-rootfs/etc/passwd"),
+                            "sandbox:x:10001:10002:Sandbox:/sandbox:/bin/sh\n",
+                        )
+                        .unwrap();
+                    }
+                    let image = if persisted_image {
+                        image_cache_rootfs_image(root, image_identity)
+                    } else {
+                        root.join("current.ext4")
+                    };
+                    create_ext4_image_from_dir_with_size(&source, &image, 32 * 1024 * 1024)
+                        .unwrap();
+                    let overlay_source = root.join("overlay-source");
+                    std::fs::create_dir_all(overlay_source.join("upper")).unwrap();
+                    let overlay = state.join(SANDBOX_OVERLAY_IMAGE);
+                    create_ext4_image_from_dir_with_size(
+                        &overlay_source,
+                        &overlay,
+                        32 * 1024 * 1024,
+                    )
+                    .unwrap();
+                    let config = VmDriverConfig {
+                        state_dir: root.to_path_buf(),
+                        ..Default::default()
+                    };
+                    let current_image = if persisted_image {
+                        root.join("missing-current.ext4")
+                    } else {
+                        image
+                    };
+
+                    let (identity, write_marker) = sandbox_owner_state_for_launch(
+                        &state,
+                        &overlay,
+                        &current_image,
+                        &config,
+                        OverlayPreparation::PreserveExisting,
+                    )
+                    .await
+                    .unwrap();
+
+                    assert_eq!(
+                        (identity.uid, identity.gid),
+                        (1000, 1000),
+                        "{layout}, v1={legacy_marker}, persisted={persisted_image}",
+                    );
+                    assert!(write_marker);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn fresh_overlay_uses_explicit_identity_without_image_inspection() {
         let dir = unique_temp_dir();
         std::fs::create_dir_all(&dir).unwrap();
@@ -9291,7 +9393,7 @@ mod tests {
         .unwrap();
         let image = dir.join("rootfs.ext4");
         create_ext4_image_from_dir_with_size(&image_source, &image, 32 * 1024 * 1024).unwrap();
-        let image_error = sandbox_owner_identity_from_image(&image)
+        let image_error = sandbox_owner_identity_from_image(&image, OverlayPreparation::Fresh)
             .await
             .expect_err("root image identity must be rejected");
         assert!(image_error.contains("uid 0 is outside the allowed range"));
