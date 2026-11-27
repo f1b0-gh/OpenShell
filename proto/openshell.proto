@@ -658,7 +658,7 @@ service OpenShell {
   }
 
   // Obtain the final provider token for the authenticated sandbox session.
-  // SPIFFE assertions and intermediate credentials remain in the gateway.
+  // The gateway exchanges the JWT-SVID and returns only the final token.
   rpc GetSandboxProviderAccessToken(GetSandboxProviderAccessTokenRequest)
       returns (GetSandboxProviderAccessTokenResponse) {
     option (openshell.options.v1.authorization) = { auth_mode: "sandbox" };
@@ -3175,12 +3175,19 @@ message ProviderEnvironmentSnapshot {
 }
 
 // Supervisor-only request. Sandbox/workspace are derived from the verified
-// session JWT. No caller-selected identity, endpoint, audience, or scope.
+// session JWT. The gateway derives the required SPIFFE identity, endpoint,
+// audience, and scope.
 message GetSandboxProviderAccessTokenRequest {
   // Opaque endpoint-bound credential key issued in the gateway's provider
   // configuration. Echo the configured key without supervisor-local revision
   // or installation decorations. Callers must not construct or parse it.
   string credential_key = 1;
+  // OAuth client assertion for the provider audience. A dedicated supervisor
+  // sets both JWT-SVID fields when provider workload identity is enabled.
+  optional string jwt_svid = 2 [(openshell.options.v1.secret) = true];
+  // Separate JWT-SVID for the launch audience. Shared supervisors omit both
+  // fields so the gateway obtains the OAuth assertion.
+  optional string launch_jwt_svid = 3 [(openshell.options.v1.secret) = true];
 }
 
 message GetSandboxProviderAccessTokenResponse {

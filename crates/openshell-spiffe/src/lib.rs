@@ -87,8 +87,7 @@ pub fn trust_domain(subject: &str) -> Option<&str> {
 /// Longest SPIFFE ID the SPIFFE specification permits.
 const MAX_SPIFFE_ID_BYTES: usize = 2048;
 
-/// Operator-configured prefix of the stable SPIFFE IDs the gateway requests
-/// for sandboxes using shared supervision.
+/// Operator-configured prefix of stable sandbox SPIFFE IDs.
 ///
 /// A sandbox's ID is `<prefix>/gateway/<gateway-id>/sandbox/<sandbox-id>`.
 /// Both IDs must already be valid SPIFFE path segments; nothing is encoded,
@@ -151,7 +150,7 @@ pub struct SandboxJwtSvid {
     pub spiffe_id: String,
     /// The signed token. It is a credential and never printed.
     pub token: String,
-    /// The verified `exp` claim, in Unix seconds.
+    /// When the verified identity expires for the grant, in Unix seconds.
     pub expires_at: i64,
 }
 

@@ -663,7 +663,12 @@ impl ServerState {
         let sandbox_identity =
             spiffe_broker::sandbox_identity_provider(&config).map_err(Error::config)?;
         let replica_id = compute::lease::replica_id();
-        let compute = compute.with_sandbox_updates(config.enable_sandbox_updates);
+        let workload_identity = spiffe_broker::SupervisorWorkloadIdentity::from_config(&config)
+            .map_err(Error::config)?;
+        let compute = compute
+            .with_sandbox_updates(config.enable_sandbox_updates)
+            .with_provider_workload_identity(workload_identity)
+            .map_err(Error::config)?;
         compute.configure_ssh_identities(credentials.clone());
         let service_route_index = Arc::new(service_routing::ServiceRouteIndex::new(
             config.service_routing_discriminator().map(str::to_string),

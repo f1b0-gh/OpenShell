@@ -172,12 +172,31 @@ pub struct ContainerConfig {
     pub labels: HashMap<String, String>,
     #[serde(default)]
     pub user: String,
+    #[serde(
+        default,
+        rename = "Env",
+        deserialize_with = "provider_spiffe_socket_from_env"
+    )]
+    pub provider_spiffe_socket: Option<String>,
     /// The immutable image ID the container was created from. Podman records
     /// the reference used at creation time here; workloads are always created
     /// from a resolved image ID, so this pins the image the container runs
     /// independently of any later tag movement.
     #[serde(default)]
     pub image: String,
+}
+
+fn provider_spiffe_socket_from_env<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let env = <Option<Vec<String>> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(env.into_iter().flatten().find_map(|entry| {
+        let (name, value) = entry.split_once('=')?;
+        (name == openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET
+            && !value.is_empty())
+        .then(|| value.to_owned())
+    }))
 }
 
 /// Immutable image metadata needed to bind OCI identity inspection to launch.

@@ -499,6 +499,9 @@ mod session {
         pub gateway_expires_at: i64,
         pub sandbox_token: SecretJwt,
         pub sandbox_expires_at: i64,
+        /// Exact provider identity selected by the gateway for this supervisor.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub provider_spiffe_id: Option<String>,
         /// Never delivered to the workload. Missing only in older bundles.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub ssh_host_private_key: Option<SecretSshHostKey>,
@@ -1787,6 +1790,7 @@ mod tests {
                 gateway_expires_at: pair.gateway.expires_at,
                 sandbox_token: pair.sandbox.token,
                 sandbox_expires_at: pair.sandbox.expires_at,
+                provider_spiffe_id: None,
                 ssh_host_private_key: None,
                 traces_otlp_headers: None,
                 ocsf_otlp_headers: None,
@@ -1935,6 +1939,7 @@ mod tests {
                 gateway_expires_at: pair.gateway.expires_at,
                 sandbox_token: pair.sandbox.token,
                 sandbox_expires_at: pair.sandbox.expires_at,
+                provider_spiffe_id: None,
                 ssh_host_private_key: None,
                 traces_otlp_headers: headers("traces"),
                 ocsf_otlp_headers: headers("ocsf"),
@@ -1974,6 +1979,7 @@ mod tests {
                 gateway_expires_at: pair.gateway.expires_at,
                 sandbox_token: pair.sandbox.token,
                 sandbox_expires_at: pair.sandbox.expires_at,
+                provider_spiffe_id: None,
                 ssh_host_private_key: Some(SecretSshHostKey::new(
                     "private-ssh-host-key".to_string(),
                 )),

@@ -1009,6 +1009,8 @@ impl BrokerProbe {
     async fn access_token(&mut self) -> Result<(String, Duration), tonic::Status> {
         let request = self.request(GetSandboxProviderAccessTokenRequest {
             credential_key: self.credential_key.clone(),
+            jwt_svid: None,
+            launch_jwt_svid: None,
         });
         self.client
             .get_sandbox_provider_access_token(request)

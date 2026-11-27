@@ -36,6 +36,7 @@ use openshell_core::driver_utils::{
     extract_first_tar_entry, supervisor_image_should_refresh, temp_extract_container_name,
     validate_linux_elf_binary,
 };
+use openshell_core::extension_protocol::COMPUTE_PROVIDER_WORKLOAD_IDENTITY;
 use openshell_core::gpu::{
     CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
     effective_driver_gpu_count, validate_cdi_device_names, validate_cdi_gpu_device_request,
@@ -1098,6 +1099,13 @@ impl DockerComputeDriver {
     }
 
     fn capabilities(&self) -> GetCapabilitiesResponse {
+        let mut capabilities = openshell_core::extension_protocol::capabilities_if(
+            openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_CONFIGURATION,
+            self.config.workspace_storage == workspace::Storage::Persistent,
+        );
+        if self.config.provider_spiffe_workload_api_socket.is_some() {
+            capabilities.push(COMPUTE_PROVIDER_WORKLOAD_IDENTITY.to_string());
+        }
         GetCapabilitiesResponse {
             resource_admission_policy: openshell_core::resource_admission::DriverAdmissionConfig {
                 allow_driver_config: self.config.allow_driver_config,
@@ -1128,14 +1136,7 @@ impl DockerComputeDriver {
                 openshell_core::extension_protocol::ExtensionFamily::Compute,
                 "openshell/docker",
                 openshell_core::VERSION,
-                if self.config.workspace_storage == workspace::Storage::Persistent {
-                    vec![
-                        openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_CONFIGURATION
-                            .to_string(),
-                    ]
-                } else {
-                    Vec::new()
-                },
+                capabilities,
             )),
         }
     }

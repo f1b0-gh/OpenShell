@@ -94,6 +94,20 @@ pub use openshell::*;
 pub use sandbox::v1::*;
 pub use test::ObjectForTest;
 
+impl std::fmt::Debug for GetSandboxProviderAccessTokenRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GetSandboxProviderAccessTokenRequest")
+            .field("credential_key", &self.credential_key)
+            .field("jwt_svid", &self.jwt_svid.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "launch_jwt_svid",
+                &self.launch_jwt_svid.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
 impl SandboxPolicy {
     /// Returns whether the explicitly present Cedar message selects the Cedar engine.
     #[must_use]
@@ -133,6 +147,20 @@ mod tests {
     use prost::Message;
 
     use super::SandboxPolicy;
+
+    #[test]
+    fn provider_access_token_request_debug_redacts_the_assertion() {
+        let request = super::GetSandboxProviderAccessTokenRequest {
+            credential_key: "configured-key".into(),
+            jwt_svid: Some("oauth-assertion-canary".into()),
+            launch_jwt_svid: Some("launch-assertion-canary".into()),
+        };
+        let output = format!("{request:?}");
+        assert!(output.contains("configured-key"));
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("oauth-assertion-canary"));
+        assert!(!output.contains("launch-assertion-canary"));
+    }
 
     #[test]
     fn empty_cedar_message_preserves_format_and_policy_identity() {

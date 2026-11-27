@@ -181,10 +181,17 @@ Select the VM driver with `--compute-driver vm`, `OPENSHELL_COMPUTE_DRIVER=vm`, 
 | `proxy_auth_allow_insecure` | unset | Required with `proxy_auth_file` against an `http://` proxy: acknowledges that Basic auth is cleartext on the connection to the proxy. |
 | `proxy_connect_by_hostname` | unset | Send hostnames rather than validated IPs in CONNECT. Last resort for proxies whose ACLs reject IP CONNECT targets. |
 | `proxy_ca_bundle` | unset | Gateway-host PEM CA bundle trusted for the corporate proxy and TLS-intercepted server certificates. The driver validates it and stages it at a fixed non-secret guest path in the protected overlay. Requires `https_proxy`. |
-| `provider_spiffe_workload_api_tcp_endpoint` | unset | Explicit guest-reachable `tcp:IP:port` SPIFFE Workload API listener for provider token exchange. It requires `provider_spiffe_allow_guest_tcp = true`; a host UNIX socket is never silently exposed to a VM guest. |
+| `provider_spiffe_workload_api_socket` | unset | Absolute SPIFFE Workload API Unix socket path on the VM driver host. The host supervisor uses it for provider token grants. |
 | `enable_bind_mounts` | `false` | Allow per-sandbox `driver_config.vm.mounts` host directory shares (libkrun virtiofs only). The driver writes a `tag\ttarget\tmode` manifest to `/.openshell/mounts.manifest` in the overlay, and guest init mounts each share after `/sandbox` ownership fixups. Rejected while resource admission is enabled. |
 
 The proxy settings are operator-owned and deployment-level: they are not accepted through `template.driver_config.vm`, and the driver passes them only to native host control. Every present-but-invalid value is fatal at gateway or sandbox startup rather than degrading to a direct dial.
+
+Configure the SPIFFE socket in the driver table or with
+`OPENSHELL_VM_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET`. The identity service must
+authorize the host supervisor to obtain the sandbox identity. The socket and
+credentials stay on the host. The driver accepts the legacy
+`provider_spiffe_workload_api_tcp_endpoint` and `provider_spiffe_allow_guest_tcp`
+settings for configuration compatibility and logs a warning if an endpoint is set.
 
 See [`openshell-gateway --help`](../openshell-server/src/cli.rs) for the gateway process flag surface.
 

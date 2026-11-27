@@ -38,8 +38,8 @@ use crate::l7::tls::{
 use crate::l7::token_grant_injection::TokenGrantResolver;
 use crate::policy_local::{DenialLogSource, PolicyLocalContext};
 use crate::proxy::ProxyHandle;
-pub use crate::token_grant::ProviderIdentitySource;
 use crate::token_grant::{GatewayTokenGrantResolver, SpiffeTokenGrantResolver};
+pub use crate::token_grant::{ProviderIdentitySource, ProviderWorkloadIdentity};
 use openshell_core::endpoint_status::EndpointObservationSender;
 use openshell_core::grpc_client::GatewayEndpoint;
 
@@ -319,12 +319,12 @@ pub async fn run_networking(
     } = instance;
     // Choose how this instance obtains provider tokens once, for every grant.
     let token_grants: Arc<dyn TokenGrantResolver> = match (provider_identity, gateway.clone()) {
-        (ProviderIdentitySource::Gateway, Some(gateway)) => {
-            Arc::new(GatewayTokenGrantResolver::new(gateway))
+        (ProviderIdentitySource::Gateway(identity), Some(gateway)) => {
+            Arc::new(GatewayTokenGrantResolver::new(gateway, identity))
         }
         // Nothing can issue this sandbox's tokens without a gateway; a
         // resolver without a workload identity fails every grant closed.
-        (ProviderIdentitySource::Gateway, None) => Arc::new(SpiffeTokenGrantResolver::new(
+        (ProviderIdentitySource::Gateway(_), None) => Arc::new(SpiffeTokenGrantResolver::new(
             None,
             sandbox_id.clone(),
             None,

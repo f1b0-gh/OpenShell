@@ -766,7 +766,12 @@ The refresh attaches to the primary credential (`access_key_id`). Each reference
 
 ### Dynamic Token Grants
 
-`token_grant` belongs to one credential declaration. When a sandbox with the provider attached sends HTTP traffic to a matching profile endpoint, the supervisor resolves the dynamic credentials, caches each returned access token separately, and injects them before forwarding the request upstream. Use `auth_style: bearer` to inject `Authorization: Bearer <token>`, or `auth_style: header` with `header_name` to inject the raw access token into a custom header.
+`token_grant` belongs to one credential declaration. When a sandbox with the
+provider attached sends HTTP traffic to a matching profile endpoint, OpenShell
+resolves each credential and caches its access token separately. The supervisor
+injects the tokens before forwarding the request. Use `auth_style: bearer` to
+inject `Authorization: Bearer <token>`, or `auth_style: header` with
+`header_name` to inject the raw access token into a custom header.
 
 Declare multiple credentials with different destination headers when one request needs independently issued tokens. Each credential keeps its own token endpoint, audience, scopes, and cache lifetime. For example, this profile sends a service bearer token and a separate workload token on the same inspected request:
 
@@ -814,7 +819,7 @@ Upgrade the gateway before the supervisor: inspected requests with a matching to
 
 Later requests use the latest installed provider credentials. If provider state or policy changes while a grant is being obtained, the supervisor rejects the request before sending it upstream. Reconnect and retry after the new configuration is ready. A token-service failure also closes the request without forwarding it; a later connection can retry the grant.
 
-OpenShell supports two dynamic grant types:
+Dedicated supervisors can perform either grant type through direct exchange.
 
 | Grant type | Behavior |
 |---|---|
@@ -828,6 +833,8 @@ openshell provider create \
   --name spiffe-token-demo \
   --type spiffe-token-demo \
   --runtime-credentials
+
+openshell sandbox create --provider spiffe-token-demo
 ```
 
 For `token_exchange` profiles, the provider also stores the user subject token referenced by `token_grant.subject_token.credential`. That credential is gateway-only: the sandbox does not receive it as environment material, static credential binding metadata, or workload placeholder ownership. Create or update that provider credential from the current gateway OIDC login with `--from-oidc-token`. This requires an active named gateway that was registered for OIDC. The CLI copies the current OIDC access token and its expiry into the provider. If the stored gateway access token is expired and a refresh token is available, the CLI refreshes it first. OpenShell does not store the OIDC refresh token in the provider. When the stored subject-token credential expires, the gateway rejects intermediate token exchange until the provider is updated with a fresh token.
@@ -854,17 +861,33 @@ Token grant fields:
 | `jwt_svid_audience` | No | Audience used when requesting the JWT-SVID. When omitted, OpenShell derives an issuer-style audience from Keycloak token endpoint paths or falls back to the full token endpoint URL. |
 | `client_assertion_type` | No | OAuth2 `client_assertion_type` form value. Defaults to RFC 7523 `urn:ietf:params:oauth:client-assertion-type:jwt-bearer`. Set `urn:ietf:params:oauth:client-assertion-type:jwt-spiffe` when the token issuer expects the SPIFFE assertion type. |
 | `scopes` | No | OAuth2 scopes sent as a space-separated `scope` parameter. |
-| `cache_ttl` | No | Protobuf-duration cache override, such as `300s`. Omission uses the token response expiry; `0s` disables caching. Shared supervisor grants require a positive override to be at least `1s` and cap it at the issuer and identity expiries. The legacy `cache_ttl_seconds` input remains accepted. |
+| `cache_ttl` | No | Protobuf-duration cache override, such as `300s`. Omission uses the token response expiry. `0s` disables caching. Gateway-mediated grants require a positive override to be at least `1s` and cap cache lifetime at the issuer and identity expiries. The legacy `cache_ttl_seconds` input remains accepted. |
 | `requested_token_type` | No | RFC 8693 `requested_token_type` sent during token exchange. Defaults to `urn:ietf:params:oauth:token-type:access_token`. |
 | `subject_token` | Required for `token_exchange` | Subject-token source used for the gateway-brokered intermediate exchange. Phase one supports `source: provider_credential`, where `credential` names another credential declared in the same profile. That referenced credential is broker-only and cannot declare workload injection metadata such as env vars, static placement, refresh, or token grant metadata. |
 | `subject_token.subject_token_type` | No | RFC 8693 `subject_token_type` for the stored subject token. Defaults to `urn:ietf:params:oauth:token-type:access_token`. |
 | `audience_overrides` | No | Endpoint-specific final-exchange `audience` and `scopes` overrides selected by host, port, and path. These overrides do not affect the gateway intermediate exchange. |
 
-Dedicated supervisors use a local SPIFFE Workload API socket for the exchanges above. Shared supervisors use the gateway's [SPIFFE Broker API integration](/how-it-works/gateways/configuration#sandbox-identity-through-the-spiffe-broker-api): the gateway obtains the stable sandbox JWT-SVID and performs both exchanges, then returns only the final access token. The intermediate audience is the stable sandbox SPIFFE ID. Only the gateway mounts the Workload API socket, including for its own JWT-SVID in `token_exchange`.
+With `spiffe_workload_identity`, a dedicated supervisor fetches two JWT-SVIDs
+from its Workload API Unix socket and sends them to the gateway for either
+grant type. Both SVIDs name the same sandbox SPIFFE ID. One has the provider as
+its sole audience and the other has an audience for the current sandbox launch.
+Set `jwt_svid_audience` to the authorization server's issuer identifier when
+the server requires it for client authentication.
+The gateway verifies both and sends the provider assertion in the OAuth
+exchange. The supervisor receives the final access token. See
+[Sandbox identity through the Workload API](/how-it-works/gateways/configuration#sandbox-identity-through-the-workload-api).
+
+Shared Kubernetes supervisors use a gateway that obtains the stable sandbox
+JWT-SVID through the SPIRE Broker API. The gateway performs the exchanges and
+returns the final access token. Only the gateway mounts the Workload API socket.
+In both gateway-mediated modes, the sandbox's verified SPIFFE ID is the
+intermediate audience for `token_exchange`. See [Sandbox identity through the SPIFFE Broker API](/how-it-works/gateways/configuration#sandbox-identity-through-the-spiffe-broker-api).
 
 Token grants apply to HTTP traffic that the proxy can inspect. Token-grant profiles reject endpoints with `protocol: sql` or `tls: skip`, including when `allow_uninspected_credentials` is enabled, because those modes cannot inject the required HTTP credential. The token service must return a token value that is safe for HTTP header placement; malformed values are rejected before caching or header injection.
 
-The gateway authorizes the sandbox session and provider attachment on every request. In the dedicated path it also verifies the supervisor JWT-SVID issuer, audience, signature, and SPIFFE trust domain. In the shared path it resolves the configured credential itself and rechecks authorization before returning even a cached token.
+The gateway authorizes the sandbox session and provider attachment for each
+gateway-mediated grant. It resolves the configured credential and rechecks
+authorization before returning any access token from its cache.
 
 ### Token Grant Failures
 

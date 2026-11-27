@@ -249,6 +249,8 @@ pub struct GatewayFileSection {
     #[serde(default)]
     pub spiffe_broker: Option<openshell_core::config::SpiffeBrokerConfig>,
     #[serde(default)]
+    pub spiffe_workload_identity: Option<openshell_core::config::SpiffeWorkloadIdentityConfig>,
+    #[serde(default)]
     pub otlp: Option<OtlpConfig>,
     #[serde(default)]
     pub ocsf_log: Option<OcsfLogConfig>,

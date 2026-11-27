@@ -1325,6 +1325,7 @@ pub struct ComputeRuntime {
     image_preparation_timeout_seconds: u32,
     provisioning_repair_window_ms: i64,
     sandbox_updates_enabled: bool,
+    provider_workload_identity: Option<crate::spiffe_broker::SupervisorWorkloadIdentity>,
     update_recovery_sweep: Arc<tokio::sync::Semaphore>,
     update_recovery_backoff: Arc<Mutex<HashMap<String, image_update::UpdateRecoveryBackoff>>>,
     store: Arc<Store>,
@@ -1448,6 +1449,7 @@ impl ComputeRuntime {
             image_preparation_timeout_seconds: 1800,
             provisioning_repair_window_ms: 300_000,
             sandbox_updates_enabled: false,
+            provider_workload_identity: None,
             update_recovery_sweep: Arc::new(tokio::sync::Semaphore::new(1)),
             update_recovery_backoff: Arc::default(),
             store,
@@ -1487,6 +1489,37 @@ impl ComputeRuntime {
         self.supervisor_host.as_ref()
     }
 
+    pub(crate) fn with_provider_workload_identity(
+        mut self,
+        identity: Option<crate::spiffe_broker::SupervisorWorkloadIdentity>,
+    ) -> Result<Self, String> {
+        if identity.is_some()
+            && (self.supervisor_host.is_some()
+                || !self
+                    .driver_info
+                    .negotiated_extension
+                    .supported_capabilities
+                    .iter()
+                    .any(|capability| {
+                        capability
+                            == openshell_core::extension_protocol::COMPUTE_PROVIDER_WORKLOAD_IDENTITY
+                    }))
+        {
+            return Err(
+                "spiffe_workload_identity requires a dedicated supervisor and a compute driver with provider Workload API support"
+                    .into(),
+            );
+        }
+        self.provider_workload_identity = identity;
+        Ok(self)
+    }
+
+    pub(crate) fn provider_workload_identity(
+        &self,
+    ) -> Option<&crate::spiffe_broker::SupervisorWorkloadIdentity> {
+        self.provider_workload_identity.as_ref()
+    }
+
     pub(crate) fn configure_ssh_identities(
         &self,
         credentials: crate::credentials::CredentialRuntime,
@@ -1522,11 +1555,22 @@ impl ComputeRuntime {
         let _ = self.supervisor_otlp_tls.set(tls);
     }
 
-    pub(crate) async fn prepare_ssh_identity(
+    pub(crate) async fn prepare_launch_identity(
         &self,
         sandbox: &mut Sandbox,
         authentication: &mut openshell_core::jwt::SandboxLaunchAuthentication,
     ) -> Result<(), Status> {
+        if let Some(identity) = self.provider_workload_identity() {
+            let spiffe_id = identity
+                .sandbox_spiffe_id(sandbox.object_id())
+                .map_err(Status::failed_precondition)?;
+            info!(
+                sandbox_id = sandbox.object_id(),
+                %spiffe_id,
+                "Configured sandbox SPIFFE identity for provider grants"
+            );
+            authentication.supervisor.provider_spiffe_id = Some(spiffe_id);
+        }
         if let Some(identities) = self.ssh_identities.get() {
             identities.prepare(sandbox, authentication).await?;
         }
@@ -1546,7 +1590,7 @@ impl ComputeRuntime {
         mut authentication: openshell_core::jwt::SandboxLaunchAuthentication,
     ) -> Result<Vec<u8>, Status> {
         let mut with_identity = sandbox.clone();
-        self.prepare_ssh_identity(&mut with_identity, &mut authentication)
+        self.prepare_launch_identity(&mut with_identity, &mut authentication)
             .await?;
         if let Some(headers) = self.supervisor_otlp_headers.get() {
             headers.apply(&mut authentication.supervisor);
@@ -9238,6 +9282,7 @@ pub fn new_test_runtime_with_driver(
         image_preparation_timeout_seconds: 1800,
         provisioning_repair_window_ms: 300_000,
         sandbox_updates_enabled: false,
+        provider_workload_identity: None,
         update_recovery_sweep: Arc::new(tokio::sync::Semaphore::new(1)),
         update_recovery_backoff: Arc::default(),
         store,
@@ -10582,6 +10627,7 @@ mod tests {
             image_preparation_timeout_seconds: 1800,
             provisioning_repair_window_ms: 300_000,
             sandbox_updates_enabled: false,
+            provider_workload_identity: None,
             update_recovery_sweep: Arc::new(Semaphore::new(1)),
             update_recovery_backoff: Arc::default(),
             store,

@@ -8,9 +8,11 @@
 //! `[openshell.gateway.spiffe_broker]` is configured.
 use std::sync::Arc;
 
-use openshell_core::config::{Config, SpiffeBrokerConfig};
+use openshell_core::config::{
+    Config, GatewayJwtConfig, SpiffeBrokerConfig, SpiffeWorkloadIdentityConfig,
+};
 use openshell_core::token_grant_failure::TokenGrantFailure;
-use openshell_spiffe::SandboxIdentityProvider;
+use openshell_spiffe::{SandboxIdentityProvider, SandboxSpiffeIdPrefix};
 
 /// Check the broker settings `config` enables without building them.
 ///
@@ -19,7 +21,57 @@ use openshell_spiffe::SandboxIdentityProvider;
 /// Rejects broker without gateway session JWTs and a positive session
 /// TTL, and settings [`SpiffeBrokerConfig::validate`] rejects.
 pub fn validate_config(config: &Config) -> Result<(), String> {
-    enabled(config).map(drop)
+    enabled(config)?;
+    SupervisorWorkloadIdentity::from_config(config).map(drop)
+}
+
+/// Trusted identity settings shared by launch provisioning and the provider broker.
+#[derive(Clone)]
+pub(crate) struct SupervisorWorkloadIdentity {
+    prefix: SandboxSpiffeIdPrefix,
+    gateway_id: String,
+    pub(crate) workload_api_socket_path: std::path::PathBuf,
+}
+
+impl SupervisorWorkloadIdentity {
+    pub(crate) fn from_config(config: &Config) -> Result<Option<Self>, String> {
+        Self::from_settings(
+            config.spiffe_workload_identity.as_ref(),
+            config.gateway_jwt.as_ref(),
+            config.spiffe_broker.is_some(),
+        )
+    }
+
+    pub(crate) fn from_settings(
+        workload: Option<&SpiffeWorkloadIdentityConfig>,
+        jwt: Option<&GatewayJwtConfig>,
+        broker_enabled: bool,
+    ) -> Result<Option<Self>, String> {
+        let Some(workload) = workload else {
+            return Ok(None);
+        };
+        if broker_enabled {
+            return Err("configure either spiffe_workload_identity or spiffe_broker".into());
+        }
+        let jwt = jwt
+            .filter(|jwt| jwt.ttl_secs.is_some())
+            .ok_or("spiffe_workload_identity requires a positive gateway_jwt.ttl_secs")?;
+        let prefix = SandboxSpiffeIdPrefix::parse(&workload.spiffe_id_prefix)?;
+        prefix.sandbox_spiffe_id(&jwt.gateway_id, "sandbox")?;
+        openshell_core::driver_utils::validate_provider_spiffe_unix_socket(
+            &workload.workload_api_socket_path,
+        )
+        .map_err(|reason| format!("spiffe_workload_identity.workload_api_socket_path: {reason}"))?;
+        Ok(Some(Self {
+            prefix,
+            gateway_id: jwt.gateway_id.clone(),
+            workload_api_socket_path: workload.workload_api_socket_path.clone(),
+        }))
+    }
+
+    pub(crate) fn sandbox_spiffe_id(&self, sandbox_id: &str) -> Result<String, String> {
+        self.prefix.sandbox_spiffe_id(&self.gateway_id, sandbox_id)
+    }
 }
 
 /// The sandbox identity provider `config` enables, if any.

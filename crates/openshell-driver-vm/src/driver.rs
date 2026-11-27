@@ -391,9 +391,9 @@ pub struct VmDriverConfig {
     /// Gateway-host PEM CA bundle staged into the guest overlay for the
     /// corporate proxy and TLS-intercepted server certificates.
     pub proxy_ca_bundle: Option<PathBuf>,
-    /// Guest-reachable SPIFFE Workload API TCP endpoint. A VM cannot safely
-    /// project a host UNIX socket; this must be a deliberately exposed TCP
-    /// listener and requires `provider_spiffe_allow_guest_tcp`.
+    /// SPIFFE Workload API Unix socket used by host supervisors.
+    pub provider_spiffe_workload_api_socket: Option<PathBuf>,
+    /// Legacy guest TCP endpoint accepted for configuration compatibility.
     pub provider_spiffe_workload_api_tcp_endpoint: Option<String>,
     #[serde(default)]
     pub provider_spiffe_allow_guest_tcp: bool,
@@ -482,6 +482,10 @@ impl std::fmt::Debug for VmDriverConfig {
             )
             .field("ipv6_egress", &self.ipv6_egress)
             .field(
+                "provider_spiffe_workload_api_socket_configured",
+                &self.provider_spiffe_workload_api_socket.is_some(),
+            )
+            .field(
                 "provider_spiffe_workload_api_tcp_endpoint_configured",
                 &self.provider_spiffe_workload_api_tcp_endpoint.is_some(),
             )
@@ -529,6 +533,7 @@ impl Default for VmDriverConfig {
             upstream_proxy: UpstreamProxyConfig::default(),
             ipv6_egress: openshell_core::SupervisorIpv6EgressConfig::default(),
             proxy_ca_bundle: None,
+            provider_spiffe_workload_api_socket: None,
             provider_spiffe_workload_api_tcp_endpoint: None,
             provider_spiffe_allow_guest_tcp: false,
             gpu_enabled: false,
@@ -564,6 +569,9 @@ impl VmDriverConfig {
             if self.upstream_proxy.https_proxy.is_none() {
                 return Err("proxy_ca_bundle is set but no https_proxy is configured".to_string());
             }
+        }
+        if let Some(socket) = self.provider_spiffe_workload_api_socket.as_deref() {
+            openshell_core::driver_utils::validate_provider_spiffe_unix_socket(socket)?;
         }
         if let Some(endpoint) = self.provider_spiffe_workload_api_tcp_endpoint.as_deref() {
             openshell_core::driver_utils::validate_guest_spiffe_tcp_endpoint(
@@ -1182,6 +1190,11 @@ impl VmDriver {
             .map_err(|err| err.message().to_string())?;
         config.validate_sandbox_identity()?;
         config.validate_runtime_security_config()?;
+        if config.provider_spiffe_workload_api_tcp_endpoint.is_some() {
+            warn!(
+                "Ignoring legacy VM SPIFFE guest TCP settings. Configure provider_spiffe_workload_api_socket for the host supervisor."
+            );
+        }
         config.validate_bootstrap_image_config()?;
         config.validate_rootfs_tar_config()?;
         if config.grpc_endpoint.trim().is_empty() {
@@ -1435,7 +1448,10 @@ impl VmDriver {
         let upstream_proxy_args = upstream_proxy_cli_args(&self.config)
             .map_err(|error| Status::invalid_argument(format!("render upstream proxy: {error}")))?;
         let mut command = Command::new(&supervisor_binary);
-        isolate_host_control_environment(&mut command);
+        configure_host_control_environment(
+            &mut command,
+            self.config.provider_spiffe_workload_api_socket.as_deref(),
+        );
         command
             .kill_on_drop(true)
             .stdin(Stdio::null())
@@ -1552,7 +1568,10 @@ impl VmDriver {
             openshell_core::extension_protocol::ExtensionFamily::Compute,
             "openshell/vm",
             openshell_core::VERSION,
-            [],
+            openshell_core::extension_protocol::capabilities_if(
+                openshell_core::extension_protocol::COMPUTE_PROVIDER_WORKLOAD_IDENTITY,
+                self.config.provider_spiffe_workload_api_socket.is_some(),
+            ),
         );
         extension
             .required_capabilities
@@ -8080,8 +8099,17 @@ fn absolute_state_dir(state_dir: &Path) -> Result<PathBuf, String> {
         .map_err(|err| format!("failed to resolve VM driver state directory: {err}"))
 }
 
-fn isolate_host_control_environment(command: &mut Command) {
+fn configure_host_control_environment(
+    command: &mut Command,
+    provider_spiffe_socket: Option<&Path>,
+) {
     command.env_clear();
+    if let Some(socket) = provider_spiffe_socket {
+        command.env(
+            openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
+            socket,
+        );
+    }
 }
 
 /// Environment that lets the supervisor export spans, joining the current
@@ -11265,6 +11293,7 @@ mod tests {
                 gateway_expires_at: 1,
                 sandbox_token: SecretJwt::parse(format!("sandbox-{label}")).expect("sandbox token"),
                 sandbox_expires_at: 1,
+                provider_spiffe_id: None,
                 ssh_host_private_key: None,
                 traces_otlp_headers: None,
                 ocsf_otlp_headers: None,
@@ -11364,9 +11393,13 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_report_configured_default_image() {
+    fn capabilities_report_driver_configuration() {
+        use openshell_core::extension_protocol::{
+            COMPUTE_PROVIDER_WORKLOAD_IDENTITY, has_capability,
+        };
+
         let (socket_root, socket_root_fd) = test_socket_root();
-        let driver = VmDriver {
+        let mut driver = VmDriver {
             config: VmDriverConfig {
                 default_image: "openshell/sandbox:dev".to_string(),
                 ..Default::default()
@@ -11396,6 +11429,17 @@ mod tests {
         assert!(negotiated.required_capabilities.iter().any(|capability| {
             capability == openshell_core::extension_protocol::COMPUTE_LAUNCH_AUTHENTICATION
         }));
+        assert!(!has_capability(
+            &negotiated.supported_capabilities,
+            COMPUTE_PROVIDER_WORKLOAD_IDENTITY,
+        ));
+
+        driver.config.provider_spiffe_workload_api_socket = Some("/run/spire/agent.sock".into());
+        let extension = driver.capabilities().extension.unwrap();
+        assert!(has_capability(
+            &extension.supported_capabilities,
+            COMPUTE_PROVIDER_WORKLOAD_IDENTITY,
+        ));
     }
 
     #[tokio::test]
@@ -12594,10 +12638,11 @@ mod tests {
     }
 
     #[test]
-    fn build_guest_environment_keeps_tls_paths_host_side() {
+    fn build_guest_environment_keeps_tls_and_spiffe_paths_host_side() {
         let config = VmDriverConfig {
             grpc_endpoint: "https://127.0.0.1:8443".to_string(),
             guest_tls_ca: Some(PathBuf::from("/host/ca.crt")),
+            provider_spiffe_workload_api_socket: Some(PathBuf::from("/run/spire/agent.sock")),
             ..Default::default()
         };
         let sandbox = Sandbox {
@@ -12609,6 +12654,9 @@ mod tests {
 
         let env = build_guest_environment(&sandbox, &config);
         assert!(!env.iter().any(|entry| entry.starts_with("OPENSHELL_TLS_")));
+        assert!(!env.iter().any(|entry| {
+            entry.starts_with(openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET)
+        }));
     }
 
     #[test]
@@ -12983,18 +13031,37 @@ mod tests {
 
     #[test]
     fn host_control_environment_contains_only_explicit_values() {
-        let mut command = Command::new("openshell-sandbox");
-        command.env("UNTRUSTED_PARENT_VALUE", "must-not-leak");
-        isolate_host_control_environment(&mut command);
-        command.env("DRIVER_OWNED_VALUE", "kept");
+        use std::ffi::OsStr;
 
-        let environment = command.as_std().get_envs().collect::<Vec<_>>();
-        assert_eq!(environment.len(), 1);
-        assert_eq!(environment[0].0, "DRIVER_OWNED_VALUE");
-        assert_eq!(
-            environment[0].1.and_then(std::ffi::OsStr::to_str),
-            Some("kept")
-        );
+        use openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET;
+
+        for configured_socket in [None, Some(Path::new("/run/spire/agent.sock"))] {
+            let mut command = Command::new("openshell-supervisor");
+            command.env("UNTRUSTED_PARENT_VALUE", "must-not-leak");
+            command.env(PROVIDER_SPIFFE_WORKLOAD_API_SOCKET, "/untrusted/agent.sock");
+            configure_host_control_environment(&mut command, configured_socket);
+            command.env("DRIVER_OWNED_VALUE", "kept");
+
+            let environment = command.as_std().get_envs().collect::<HashMap<_, _>>();
+            assert_eq!(
+                environment.len(),
+                1 + usize::from(configured_socket.is_some())
+            );
+            assert_eq!(
+                environment
+                    .get(OsStr::new("DRIVER_OWNED_VALUE"))
+                    .copied()
+                    .flatten(),
+                Some(OsStr::new("kept"))
+            );
+            assert_eq!(
+                environment
+                    .get(OsStr::new(PROVIDER_SPIFFE_WORKLOAD_API_SOCKET))
+                    .copied()
+                    .flatten(),
+                configured_socket.map(Path::as_os_str)
+            );
+        }
     }
 
     #[test]

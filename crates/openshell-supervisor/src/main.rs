@@ -16,6 +16,7 @@ use openshell_core::jwt::{
 };
 use openshell_core::sandbox_env::OtlpProtocol;
 use openshell_isolation_interface::contract::BackendDescriptor;
+use openshell_supervisor_network::run::{ProviderIdentitySource, ProviderWorkloadIdentity};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
@@ -698,6 +699,23 @@ fn main() -> Result<()> {
                     .map(openshell_supervisor::app_listener::Config::bind)
                     .transpose()?
                     .map(openshell_supervisor::app_listener::BoundListener::start);
+                let workload_api_socket = std::env::var_os(
+                    openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
+                )
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from);
+                let provider_identity = match &auth_bundle.provider_spiffe_id {
+                    Some(spiffe_id) => {
+                        ProviderIdentitySource::Gateway(Some(ProviderWorkloadIdentity {
+                            workload_api_socket,
+                            spiffe_id: spiffe_id.clone(),
+                            launch_audience: auth_bundle
+                                .runtime_generation
+                                .provider_spiffe_audience(),
+                        }))
+                    }
+                    None => ProviderIdentitySource::WorkloadApi(workload_api_socket),
+                };
                 let config = openshell_supervisor::SandboxInstanceConfig {
                     app_router: app_host
                         .as_ref()
@@ -734,14 +752,7 @@ fn main() -> Result<()> {
                         args.attach_request_timeout_seconds,
                     ),
                     trace_context: openshell_supervisor::trace_context_from_environment(),
-                    provider_identity:
-                        openshell_supervisor_network::run::ProviderIdentitySource::WorkloadApi(
-                            std::env::var_os(
-                                openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
-                            )
-                            .filter(|path| !path.is_empty())
-                            .map(PathBuf::from),
-                        ),
+                    provider_identity,
                     proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::from_environment(),
                     takeover: None,
                     supervisor_recovery_timeout_secs: None,
@@ -1283,6 +1294,7 @@ mod tests {
             gateway_expires_at: 0,
             sandbox_token: SecretJwt::parse("test-sandbox-token").unwrap(),
             sandbox_expires_at: 0,
+            provider_spiffe_id: None,
             ssh_host_private_key: None,
             traces_otlp_headers: secret("lane=traces"),
             ocsf_otlp_headers: secret("lane=ocsf"),

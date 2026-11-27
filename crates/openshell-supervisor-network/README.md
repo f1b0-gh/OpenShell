@@ -26,17 +26,18 @@ several sandbox instances. `run_networking` selects the instance's token grant
 resolver once from its identity source; a token acquired for one sandbox is
 never served to another.
 
-A dedicated supervisor uses `SpiffeTokenGrantResolver` with its SPIFFE Workload
-API socket. That resolver owns the instance's token cache and HTTP client and
-uses the gateway only for the intermediate exchange of RFC 8693 grants.
-Without a socket, its grants fail closed. Shared sandbox instances use
-`GatewayTokenGrantResolver`, which holds only the instance's authenticated
-gateway channel, connected on the first grant and reused. Each admitted
-operation forwards a configured dynamic credential key and request ID; the
-gateway derives the sandbox identity,
-validates current authorization, resolves grant parameters, and obtains the
-final access token, which the resolver validates. No SPIRE client, SVID,
-intermediate token, or grant cache is used in the shared supervisor.
+A dedicated supervisor can use `SpiffeTokenGrantResolver` with its SPIFFE
+Workload API socket. That resolver owns the instance's token cache and HTTP
+client and uses the gateway for the intermediate exchange of RFC 8693 grants.
+
+`GatewayTokenGrantResolver` sends a configured credential key and request ID
+over a reused, authenticated gateway channel. A dedicated supervisor with
+provider workload identity enabled fetches two JWT-SVIDs for its expected
+SPIFFE ID. One carries the provider audience and the other binds the launch.
+It forwards both to the gateway over TLS or loopback. For shared supervision,
+the gateway obtains the JWT-SVID directly. In both cases, the gateway verifies
+the active session and grant, then returns the final provider access token.
+
 `mise run e2e:kubernetes:shared-supervisor-spiffe` exercises the gateway's
 SPIFFE Broker API flow against a real server and agent. A process hosting
 several instances serves

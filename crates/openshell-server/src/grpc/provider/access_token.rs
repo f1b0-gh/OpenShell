@@ -19,8 +19,10 @@ use openshell_core::proto::{
     GetSandboxProviderAccessTokenRequest, GetSandboxProviderAccessTokenResponse,
     ProviderCredentialTokenGrant,
 };
-use openshell_core::token_grant_failure::BROKERED_TOKEN_GATEWAY_DEADLINE;
-use openshell_spiffe::SandboxIdentityProvider;
+use openshell_core::token_grant_failure::{
+    BROKERED_TOKEN_GATEWAY_DEADLINE, WORKLOAD_IDENTITY_CALL_TIMEOUT,
+};
+use openshell_spiffe::{SandboxIdentityProvider, SandboxJwtSvid};
 use std::time::Duration;
 
 static ACCESS_TOKENS: LazyLock<IntermediateTokenCache> = LazyLock::new(IntermediateTokenCache::new);
@@ -202,6 +204,87 @@ struct Subject {
     expires_at_ms: Option<i64>,
 }
 
+#[derive(Clone, Copy)]
+enum GrantIdentity<'a> {
+    Broker(&'a dyn SandboxIdentityProvider<Error = TokenGrantFailure>),
+    Supervisor(&'a SandboxJwtSvid),
+}
+
+async fn validate_workload_assertion(
+    identity: &crate::spiffe_broker::SupervisorWorkloadIdentity,
+    session: &AuthenticatedSandboxSession,
+    grant: &ProviderCredentialTokenGrant,
+    token: &str,
+    launch_token: &str,
+) -> Result<SandboxJwtSvid, Status> {
+    let expected_id = identity
+        .sandbox_spiffe_id(session.sandbox_id.as_str())
+        .map_err(|_| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
+    let audience = effective_jwt_svid_audience(&grant.token_endpoint, &grant.jwt_svid_audience);
+    let launch_audience = session.runtime_generation.provider_spiffe_audience();
+    let endpoint = openshell_spiffe::workload_api_endpoint(&identity.workload_api_socket_path);
+    let bundles = tokio::time::timeout(WORKLOAD_IDENTITY_CALL_TIMEOUT, async {
+        let client = spiffe::WorkloadApiClient::connect_to(&endpoint)
+            .await
+            .map_err(|error| {
+                super::token_grant_workload_api_status(error, tonic::Code::FailedPrecondition)
+            })?;
+        client
+            .fetch_jwt_bundles()
+            .await
+            .map_err(|error| super::token_grant_workload_api_status(error, tonic::Code::Internal))
+    })
+    .await
+    .map_err(|_| {
+        TokenGrantFailure::new(
+            TokenGrantFailureKind::Timeout,
+            TokenGrantStage::WorkloadIdentity,
+        )
+        .to_status()
+    })??;
+    verify_workload_assertion(
+        token,
+        launch_token,
+        &bundles,
+        expected_id,
+        &audience,
+        &launch_audience,
+    )
+}
+
+fn verify_workload_assertion(
+    token: &str,
+    launch_token: &str,
+    bundles: &spiffe::JwtBundleSet,
+    expected_id: String,
+    audience: &str,
+    launch_audience: &str,
+) -> Result<SandboxJwtSvid, Status> {
+    let rejection = || token_grant_identity_rejected(tonic::Code::PermissionDenied);
+    openshell_crypto::install_jwt_provider();
+    if audience == launch_audience {
+        return Err(rejection());
+    }
+    let verify = |token: &str, audience: &str| {
+        let svid = spiffe::JwtSvid::parse_and_validate(token, bundles, &[audience])
+            .map_err(|_| rejection())?;
+        let expires_at = svid.expiry().unix_timestamp();
+        if svid.spiffe_id().to_string() != expected_id
+            || svid.audience().len() != 1
+            || expires_at.saturating_mul(1000) <= crate::persistence::current_time_ms()
+        {
+            return Err(rejection());
+        }
+        Ok(expires_at)
+    };
+    let expires_at = verify(token, audience)?.min(verify(launch_token, launch_audience)?);
+    Ok(SandboxJwtSvid {
+        spiffe_id: expected_id,
+        token: token.to_string(),
+        expires_at,
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 async fn obtain(
     state: &Arc<ServerState>,
@@ -228,24 +311,32 @@ async fn obtain(
     // Bound outstanding work after authentication, independently of caching.
     // A busy sandbox cannot occupy the gateway's entire acquisition budget.
     let _admission = ADMISSION.enter(session.sandbox_id.as_str())?;
-    // Startup enables an identity provider only with gateway session JWTs.
-    let (Some(identity), Some(gateway_jwt)) = (
-        state.sandbox_identity.as_deref(),
-        state.config.gateway_jwt.as_ref(),
-    ) else {
-        return Err(token_grant_configuration_status(
-            tonic::Code::FailedPrecondition,
-        ));
-    };
-    if state.compute.configured_driver_name() != "kubernetes" {
-        return Err(token_grant_configuration_status(
-            tonic::Code::FailedPrecondition,
-        ));
+    let unavailable = || token_grant_configuration_status(tonic::Code::FailedPrecondition);
+    let gateway_jwt = state.config.gateway_jwt.as_ref().ok_or_else(unavailable)?;
+    let supplied = request.get_ref().jwt_svid.as_deref();
+    let launch_proof = request.get_ref().launch_jwt_svid.as_deref();
+    let supervisor_identity = state.compute.provider_workload_identity();
+    let broker = state.sandbox_identity.as_deref();
+    if supervisor_identity.is_none()
+        && (broker.is_none() || state.compute.configured_driver_name() != "kubernetes")
+    {
+        return Err(unavailable());
     }
     let gateway_id = gateway_jwt.gateway_id.as_str();
     let key = &request.get_ref().credential_key;
     let configured = grant_configuration(state, session.sandbox_id.as_str(), key).await?;
     let grant = &configured.grant;
+    // Every dedicated request presents a verified assertion, including cache hits.
+    let assertion;
+    let identity = match (supervisor_identity, supplied, launch_proof) {
+        (Some(identity), Some(token), Some(launch_proof)) => {
+            assertion =
+                validate_workload_assertion(identity, &session, grant, token, launch_proof).await?;
+            GrantIdentity::Supervisor(&assertion)
+        }
+        (None, None, None) => GrantIdentity::Broker(broker.ok_or_else(unavailable)?),
+        _ => return Err(token_grant_identity_rejected(tonic::Code::PermissionDenied)),
+    };
     let ttl_override = grant
         .cache_ttl
         .as_ref()
@@ -346,7 +437,14 @@ async fn obtain(
         authorize(state, &bearer).await?;
         // The lifetime runs from when the token service answered, so time spent
         // in the final validation counts against it.
-        let remaining_ms = serve_until_ms.saturating_sub(crate::persistence::current_time_ms());
+        let request_expires_at_ms = match identity {
+            GrantIdentity::Broker(_) => serve_until_ms,
+            GrantIdentity::Supervisor(svid) => {
+                serve_until_ms.min(svid.expires_at.saturating_mul(1000))
+            }
+        };
+        let remaining_ms =
+            request_expires_at_ms.saturating_sub(crate::persistence::current_time_ms());
         if remaining_ms <= 0 && !acquired {
             // A hit can expire during the final asynchronous checks. Refresh once;
             // a fresh acquisition still must pass every check before it is served.
@@ -382,7 +480,7 @@ async fn acquire(
     state: &ServerState,
     bearer: &str,
     session: &AuthenticatedSandboxSession,
-    identity: &dyn SandboxIdentityProvider<Error = TokenGrantFailure>,
+    identity: GrantIdentity<'_>,
     gateway_id: &str,
     grant: &ProviderCredentialTokenGrant,
     subject: Option<&Subject>,
@@ -391,43 +489,63 @@ async fn acquire(
 ) -> Result<(oauth::OAuthTokenResponse, i64), Status> {
     authorize(state, bearer).await?;
     let audience = effective_jwt_svid_audience(&grant.token_endpoint, &grant.jwt_svid_audience);
-    let sandbox = state
-        .store
-        .get_message::<Sandbox>(session.sandbox_id.as_str())
-        .await
-        .map_err(|_| token_grant_store_status())?
-        .ok_or_else(|| token_grant_identity_rejected(tonic::Code::Unauthenticated))?;
-    let runtime_identity = sandbox
-        .metadata
-        .as_ref()
-        .and_then(|metadata| {
-            metadata
-                .annotations
-                .get(crate::compute::COMPUTE_RUNTIME_IDENTITY_ANNOTATION)
-        })
-        .map_or("", String::as_str);
-    let svid = identity
-        .fetch_jwt_svid(
-            gateway_id,
-            session.sandbox_id.as_str(),
-            &audience,
-            runtime_identity,
-        )
-        .await
-        .map_err(TokenGrantFailure::to_status)?;
+    let issued;
+    let svid = match identity {
+        GrantIdentity::Broker(provider) => {
+            let sandbox = state
+                .store
+                .get_message::<Sandbox>(session.sandbox_id.as_str())
+                .await
+                .map_err(|_| token_grant_store_status())?
+                .ok_or_else(|| token_grant_identity_rejected(tonic::Code::Unauthenticated))?;
+            let runtime_identity = sandbox
+                .metadata
+                .as_ref()
+                .and_then(|metadata| {
+                    metadata
+                        .annotations
+                        .get(crate::compute::COMPUTE_RUNTIME_IDENTITY_ANNOTATION)
+                })
+                .map_or("", String::as_str);
+            issued = provider
+                .fetch_jwt_svid(
+                    gateway_id,
+                    session.sandbox_id.as_str(),
+                    &audience,
+                    runtime_identity,
+                )
+                .await
+                .map_err(TokenGrantFailure::to_status)?;
+            &issued
+        }
+        GrantIdentity::Supervisor(svid) => svid,
+    };
     authorize(state, bearer).await?;
+    let require_live_assertion = || {
+        if svid.expires_at.saturating_mul(1000) <= crate::persistence::current_time_ms() {
+            return Err(token_grant_identity_rejected(tonic::Code::PermissionDenied));
+        }
+        Ok(())
+    };
+    require_live_assertion()?;
     let client = token_exchange_http_client()?;
     let subject_expiry = subject.and_then(|subject| subject.expires_at_ms);
     let token = if let Some(subject) = subject {
-        let component_svid = fetch_gateway_jwt_svid_from(
-            &audience,
-            state
-                .config
-                .spiffe_broker
-                .as_ref()
-                .map(|broker| broker.workload_api_socket_path.as_str()),
-        )
-        .await?;
+        let component_socket = state
+            .config
+            .spiffe_workload_identity
+            .as_ref()
+            .and_then(|identity| identity.workload_api_socket_path.to_str())
+            .or_else(|| {
+                state
+                    .config
+                    .spiffe_broker
+                    .as_ref()
+                    .map(|broker| broker.workload_api_socket_path.as_str())
+            });
+        let component_svid = fetch_gateway_jwt_svid_from(&audience, component_socket).await?;
+        authorize(state, bearer).await?;
+        require_live_assertion()?;
         let intermediate = perform_intermediate_token_exchange(
             &grant.token_endpoint,
             &TokenExchangeParams {
@@ -443,6 +561,7 @@ async fn acquire(
         )
         .await?;
         authorize(state, bearer).await?;
+        require_live_assertion()?;
         oauth::post_oauth_token_exchange(
             client,
             &grant.token_endpoint,
@@ -688,6 +807,8 @@ mod tests {
         ] {
             let mut request = Request::new(GetSandboxProviderAccessTokenRequest {
                 credential_key: "untrusted".into(),
+                jwt_svid: None,
+                launch_jwt_svid: None,
             });
             request.extensions_mut().insert(principal);
             let error = handle(&state, request).await.unwrap_err();
@@ -695,6 +816,99 @@ mod tests {
                 error.code(),
                 tonic::Code::Unauthenticated | tonic::Code::PermissionDenied
             ));
+        }
+    }
+
+    #[test]
+    fn workload_assertion_requires_the_exact_sandbox_and_active_launch() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use openshell_core::sandbox_generation::SandboxGenerationId;
+        use rcgen::PublicKeyData as _;
+
+        let key =
+            openshell_crypto::pki::generate_keypair_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let public_key = key.der_bytes();
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+        header.kid = Some("workload-test".into());
+        let jwks = serde_json::json!({
+            "keys": [{
+                "kty": "EC", "crv": "P-256", "alg": "ES256", "kid": "workload-test",
+                "x": URL_SAFE_NO_PAD.encode(&public_key[1..33]),
+                "y": URL_SAFE_NO_PAD.encode(&public_key[33..65]),
+            }]
+        });
+        let mut bundles = spiffe::JwtBundleSet::new();
+        bundles.add_bundle(
+            spiffe::JwtBundle::from_jwt_authorities(
+                spiffe::TrustDomain::new("test.example").unwrap(),
+                &serde_json::to_vec(&jwks).unwrap(),
+            )
+            .unwrap(),
+        );
+        let encoding_key =
+            jsonwebtoken::EncodingKey::from_ec_pem(key.serialize_pem().unwrap().as_bytes())
+                .unwrap();
+        let now = crate::persistence::current_time_ms() / 1000;
+        let sign_until = |subject: &str, audiences: &[&str], expires_at| {
+            openshell_crypto::jwt::encode(
+                &header,
+                &serde_json::json!({"sub": subject, "aud": audiences, "exp": expires_at}),
+                &encoding_key,
+            )
+            .unwrap()
+        };
+        let sign = |subject: &str, audiences: &[&str]| sign_until(subject, audiences, now + 120);
+        let sandboxes = [
+            "spiffe://test.example/gateway/gateway/sandbox/a",
+            "spiffe://test.example/gateway/gateway/sandbox/b",
+        ];
+        let launch = SandboxGenerationId::parse("g2")
+            .unwrap()
+            .provider_spiffe_audience();
+        let older = SandboxGenerationId::parse("g1")
+            .unwrap()
+            .provider_spiffe_audience();
+        let audience = "https://issuer.test/token";
+        let verify = |token: &str, launch_token: &str, expected: &str| {
+            verify_workload_assertion(
+                token,
+                launch_token,
+                &bundles,
+                expected.to_owned(),
+                audience,
+                &launch,
+            )
+        };
+        for subject in sandboxes {
+            let token = sign(subject, &[audience]);
+            let launch_proof = sign(subject, &[&launch]);
+            let verified = verify(&token, &launch_proof, subject).unwrap();
+            assert_eq!(verified.spiffe_id, subject);
+        }
+        let token = sign(sandboxes[0], &[audience]);
+        let proof = sign(sandboxes[0], &[&launch]);
+        let shorter_provider = sign_until(sandboxes[0], &[audience], now + 60);
+        let shorter_launch = sign_until(sandboxes[0], &[&launch], now + 60);
+        for (provider, launch_proof) in [(&shorter_provider, &proof), (&token, &shorter_launch)] {
+            assert_eq!(
+                verify(provider, launch_proof, sandboxes[0])
+                    .unwrap()
+                    .expires_at,
+                now + 60
+            );
+        }
+        for (token, proof) in [
+            (sign(sandboxes[1], &[audience]), proof.clone()),
+            (token.clone(), sign(sandboxes[1], &[&launch])),
+            (token.clone(), sign(sandboxes[0], &[&older])),
+            (token.clone(), token.clone()),
+            (sign(sandboxes[0], &[audience, &launch]), proof),
+        ] {
+            assert_eq!(
+                verify(&token, &proof, sandboxes[0]).unwrap_err().code(),
+                tonic::Code::PermissionDenied
+            );
         }
     }
 

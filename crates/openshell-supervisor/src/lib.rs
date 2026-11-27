@@ -4817,6 +4817,7 @@ mod tests {
             sandbox_token: openshell_core::jwt::SecretJwt::parse("test-sandbox-token")
                 .expect("token"),
             sandbox_expires_at: 0,
+            provider_spiffe_id: None,
             ssh_host_private_key: None,
             traces_otlp_headers: None,
             ocsf_otlp_headers: None,

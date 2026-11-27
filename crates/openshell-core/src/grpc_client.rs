@@ -1747,6 +1747,12 @@ pub async fn exchange_provider_subject_token(
     ))
 }
 
+/// A dedicated supervisor's OAuth assertion and launch proof.
+pub struct ProviderWorkloadAssertions {
+    pub jwt_svid: String,
+    pub launch_jwt_svid: String,
+}
+
 /// Final provider access tokens for one sandbox instance over one reused
 /// gateway channel.
 ///
@@ -1782,9 +1788,29 @@ impl SandboxProviderTokenClient {
         }
     }
 
-    /// Obtain only the final access token; the gateway selects and verifies
-    /// the sandbox identity and resolves all grant parameters from its
-    /// configuration.
+    /// Validate the gateway before fetching a local workload assertion.
+    /// A plaintext endpoint must identify loopback without DNS.
+    ///
+    /// # Errors
+    /// Returns a configuration failure for an invalid gateway URL or a
+    /// remote plaintext endpoint.
+    pub fn require_attested_transport(&self) -> std::result::Result<(), TokenGrantFailure> {
+        let (endpoint, _) = self.gateway.as_ref().map_err(|failure| *failure)?;
+        let direct_loopback = match endpoint.host() {
+            Some(url::Host::Ipv4(address)) => address.is_loopback(),
+            Some(url::Host::Ipv6(address)) => address.is_loopback(),
+            _ => false,
+        };
+        if endpoint.scheme() == "https" || direct_loopback {
+            Ok(())
+        } else {
+            Err(gateway_grant_failure(TokenGrantFailureKind::Configuration))
+        }
+    }
+
+    /// Obtain the final access token. The gateway verifies the sandbox
+    /// identity and resolves grant parameters from its configuration.
+    /// A dedicated supervisor can supply its attested JWT-SVIDs.
     ///
     /// One deadline bounds connection readiness and the call. Network failures
     /// do not serialize channel initialization for concurrent requests.
@@ -1792,9 +1818,16 @@ impl SandboxProviderTokenClient {
     pub async fn get_access_token(
         &self,
         credential_key: &str,
+        assertions: Option<ProviderWorkloadAssertions>,
         request_id: Option<&str>,
     ) -> std::result::Result<ProviderSubjectTokenExchangeResult, TokenGrantFailure> {
         let (endpoint, gateway) = self.gateway.as_ref().map_err(|failure| *failure)?;
+        let (jwt_svid, launch_jwt_svid) = if let Some(assertions) = assertions {
+            self.require_attested_transport()?;
+            (Some(assertions.jwt_svid), Some(assertions.launch_jwt_svid))
+        } else {
+            (None, None)
+        };
         // Like connect(), refuse locally revoked sandbox instance credentials
         // before the call; the response boundary rejects them again.
         let unavailable = || gateway_grant_failure(TokenGrantFailureKind::Unavailable);
@@ -1805,6 +1838,8 @@ impl SandboxProviderTokenClient {
             .ok_or_else(|| gateway_grant_failure(TokenGrantFailureKind::Configuration))?;
         let mut request = tonic::Request::new(crate::proto::GetSandboxProviderAccessTokenRequest {
             credential_key: key,
+            jwt_svid,
+            launch_jwt_svid,
         });
         if let Some(value) = request_id.and_then(|value| value.parse().ok()) {
             request.metadata_mut().insert("x-request-id", value);
@@ -1993,8 +2028,8 @@ mod token_grant_exchange_tests {
         );
         let started = tokio::time::Instant::now();
         let results: [_; 2] = tokio::join!(
-            client.get_access_token("api.test\t443\t/\towner\tprovider:token", None),
-            client.get_access_token("api.test\t443\t/\towner\tprovider:token", None),
+            client.get_access_token("api.test\t443\t/\towner\tprovider:token", None, None),
+            client.get_access_token("api.test\t443\t/\towner\tprovider:token", None, None),
         )
         .into();
         for result in results {
@@ -2016,8 +2051,49 @@ mod token_grant_exchange_tests {
                 TokenSource::Env,
             ),
         ));
-        let failure = invalid.get_access_token("key", None).await.err().unwrap();
+        let failure = invalid
+            .get_access_token("key", None, None)
+            .await
+            .err()
+            .unwrap();
         assert_eq!(failure.kind(), TokenGrantFailureKind::Configuration);
+    }
+
+    #[tokio::test]
+    async fn access_token_client_keeps_assertions_off_nonlocal_plaintext() {
+        let client = |url| {
+            SandboxProviderTokenClient::new(GatewayEndpoint::new(
+                url,
+                GatewayCredentials::new(
+                    AsciiMetadataValue::from_static("Bearer test"),
+                    TokenSource::Env,
+                ),
+            ))
+        };
+        for url in ["http://192.0.2.2:8080", "http://localhost:8080"] {
+            let client = client(url);
+            let failure = client
+                .get_access_token(
+                    "api.test\t443\t/\towner\tprovider:token",
+                    Some(ProviderWorkloadAssertions {
+                        jwt_svid: "oauth-assertion-canary".into(),
+                        launch_jwt_svid: "launch-assertion-canary".into(),
+                    }),
+                    None,
+                )
+                .await
+                .err()
+                .expect("nonlocal plaintext must reject a workload assertion");
+            assert_eq!(failure.kind(), TokenGrantFailureKind::Configuration);
+            assert!(client.client.get().is_none());
+        }
+        for url in [
+            "https://gateway.test:8080",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+        ] {
+            assert!(client(url).require_attested_transport().is_ok());
+        }
     }
 
     #[test]

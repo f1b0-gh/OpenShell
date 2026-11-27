@@ -3,7 +3,7 @@
 
 //! Container spec construction for the Podman driver.
 
-use crate::client::ImageInspect;
+use crate::client::{ContainerInspect, ImageInspect};
 use crate::config::PodmanComputeConfig;
 use openshell_core::ComputeDriverError;
 use openshell_core::driver_mounts::SelinuxLabel;
@@ -75,6 +75,8 @@ const PROXY_CA_MOUNT_PATH: &str = openshell_core::driver_utils::PROXY_CA_MOUNT_P
 const ADDITIONAL_CA_MOUNT_PATH: &str = openshell_core::driver_utils::ADDITIONAL_CA_MOUNT_PATH;
 const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR: &str =
     openshell_core::driver_utils::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR;
+const PROVIDER_SPIFFE_LAUNCH_BUNDLE_LABEL: &str = "openshell.ai/provider-spiffe-launch-bundle";
+const PROVIDER_SPIFFE_LAUNCH_BUNDLE_VERSION: &str = "1";
 
 /// Directory inside sandbox containers where the supervisor binary is mounted.
 const SUPERVISOR_MOUNT_DIR: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_DIR;
@@ -1714,6 +1716,13 @@ pub fn build_isolation_specs(
         NETWORK_SUPERVISOR_TRUST_GENERATION_KEY.into(),
         network_trust_generation(input.network_trust).into(),
     );
+    // Mark supervisors whose launch bundle can carry the exact provider ID.
+    // A matching Workload API socket on an older container does not imply it
+    // understands this field.
+    supervisor.labels.insert(
+        PROVIDER_SPIFFE_LAUNCH_BUNDLE_LABEL.into(),
+        PROVIDER_SPIFFE_LAUNCH_BUNDLE_VERSION.into(),
+    );
     supervisor.image.clone_from(&input.config.supervisor_image);
     supervisor.env.insert(
         openshell_core::sandbox_env::CONTAINER_IMAGE_UID.into(),
@@ -1856,6 +1865,49 @@ fn provider_spiffe_workload_api_socket_mount_source(config: &PodmanComputeConfig
         .strip_prefix("unix:")
         .map_or(host_path.as_path(), Path::new);
     host_path.parent()
+}
+
+pub(crate) fn provider_spiffe_configuration_matches(
+    config: &PodmanComputeConfig,
+    supervisor: &ContainerInspect,
+    requires_provider_spiffe_id: bool,
+) -> bool {
+    if requires_provider_spiffe_id
+        && supervisor
+            .config
+            .labels
+            .get(PROVIDER_SPIFFE_LAUNCH_BUNDLE_LABEL)
+            .map(String::as_str)
+            != Some(PROVIDER_SPIFFE_LAUNCH_BUNDLE_VERSION)
+    {
+        return false;
+    }
+    if supervisor.config.provider_spiffe_socket
+        != provider_spiffe_workload_api_socket_env_value(config)
+    {
+        return false;
+    }
+    let mut projected_mounts = supervisor
+        .mounts
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter(|mount| {
+            mount["Destination"].as_str() == Some(PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR)
+        });
+    match (
+        provider_spiffe_workload_api_socket_mount_source(config),
+        projected_mounts.next(),
+    ) {
+        (None, None) => true,
+        (Some(source), Some(mount)) => {
+            mount["Type"].as_str() == Some("bind")
+                && mount["Source"].as_str().map(Path::new) == Some(source)
+                && mount["RW"].as_bool() == Some(false)
+                && projected_mounts.next().is_none()
+        }
+        _ => false,
+    }
 }
 
 fn hostadd_entries(config: &PodmanComputeConfig) -> Vec<String> {
@@ -2008,6 +2060,20 @@ mod tests {
                 .get(NETWORK_SUPERVISOR_TRUST_GENERATION_KEY)
                 .map(String::as_str),
             Some("sha256:paired-digest")
+        );
+        assert_eq!(
+            specs
+                .supervisor
+                .labels
+                .get(PROVIDER_SPIFFE_LAUNCH_BUNDLE_LABEL)
+                .map(String::as_str),
+            Some(PROVIDER_SPIFFE_LAUNCH_BUNDLE_VERSION),
+        );
+        assert!(
+            !specs
+                .workload
+                .labels
+                .contains_key(PROVIDER_SPIFFE_LAUNCH_BUNDLE_LABEL)
         );
         assert!(
             specs
@@ -4210,6 +4276,67 @@ mod tests {
                 && m["source"].as_str() == Some("/host")
                 && m["destination"].as_str() == Some(PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR)
         }));
+    }
+
+    #[test]
+    fn stopped_supervisor_spiffe_configuration_tracks_socket_and_launch_bundle_changes() {
+        use openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET;
+
+        let configured = |socket: Option<&str>| PodmanComputeConfig {
+            provider_spiffe_workload_api_socket: socket.map(Into::into),
+            ..test_config()
+        };
+        let inspected = |socket: Option<&str>, source: Option<&str>| {
+            let env =
+                socket.map(|socket| format!("{PROVIDER_SPIFFE_WORKLOAD_API_SOCKET}={socket}"));
+            let mounts = source.map(|source| {
+                serde_json::json!({
+                    "Type": "bind",
+                    "Source": source,
+                    "Destination": PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR,
+                    "RW": false,
+                })
+            });
+            serde_json::from_value::<ContainerInspect>(serde_json::json!({
+                "Id": "supervisor",
+                "Name": "openshell-supervisor-sandbox",
+                "State": {"Status": "exited", "Running": false},
+                "Config": {"Env": env.into_iter().collect::<Vec<_>>()},
+                "Mounts": mounts.into_iter().collect::<Vec<_>>(),
+            }))
+            .unwrap()
+        };
+        let absent = inspected(None, None);
+        let unix = inspected(Some("/spiffe-workload-api/agent.sock"), Some("/host/spire"));
+        let tcp = inspected(Some("tcp:127.0.0.1:8081"), None);
+
+        for (old, socket, matches) in [
+            (&absent, None, true),
+            (&absent, Some("/host/spire/agent.sock"), false),
+            (&unix, Some("/host/spire/agent.sock"), true),
+            (&unix, Some("/other/spire/agent.sock"), false),
+            (&unix, Some("/host/spire/new.sock"), false),
+            (&unix, None, false),
+            (&tcp, Some("tcp:127.0.0.1:8081"), true),
+            (&tcp, None, false),
+        ] {
+            assert_eq!(
+                provider_spiffe_configuration_matches(&configured(socket), old, false),
+                matches,
+                "{socket:?}"
+            );
+        }
+
+        let config = configured(Some("/host/spire/agent.sock"));
+        assert!(!provider_spiffe_configuration_matches(&config, &unix, true));
+        let mut upgraded = unix;
+        upgraded.config.labels.insert(
+            PROVIDER_SPIFFE_LAUNCH_BUNDLE_LABEL.into(),
+            PROVIDER_SPIFFE_LAUNCH_BUNDLE_VERSION.into(),
+        );
+        assert!(provider_spiffe_configuration_matches(
+            &config, &upgraded, true
+        ));
     }
 
     #[test]

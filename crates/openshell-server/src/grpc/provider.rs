@@ -4828,6 +4828,11 @@ async fn exchange_provider_subject_token_inner(
         )
         .to_status_with_code(code));
     }
+    if state.compute.provider_workload_identity().is_some() {
+        return Err(token_grant_configuration_status(
+            tonic::Code::FailedPrecondition,
+        ));
+    }
     drop(request);
 
     if req.provider.trim().is_empty()
@@ -6568,6 +6573,8 @@ pub(super) mod tests {
             let mut request = Request::new(
                 openshell_core::proto::GetSandboxProviderAccessTokenRequest {
                     credential_key: SECRET.to_string(),
+                    jwt_svid: None,
+                    launch_jwt_svid: None,
                 },
             );
             request

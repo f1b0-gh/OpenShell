@@ -55,6 +55,12 @@ impl SandboxGenerationId {
         &self.0
     }
 
+    /// Bind a provider JWT-SVID to the current OpenShell launch as well as its OAuth audience.
+    #[must_use]
+    pub fn provider_spiffe_audience(&self) -> String {
+        format!("urn:openshell:provider-grants:launch:{self}")
+    }
+
     #[must_use]
     pub fn into_string(self) -> String {
         self.0

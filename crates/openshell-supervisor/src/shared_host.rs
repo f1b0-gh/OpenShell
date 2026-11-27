@@ -907,7 +907,9 @@ impl SharedHost {
             trace_context: registration.trace_context,
             // The gateway owns each sandbox's workload identity and returns
             // only final provider access tokens.
-            provider_identity: openshell_supervisor_network::run::ProviderIdentitySource::Gateway,
+            provider_identity: openshell_supervisor_network::run::ProviderIdentitySource::Gateway(
+                None,
+            ),
             proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles {
                 ca_certificate: Some(ca_certificate),
                 ca_private_key: Some(ca_private_key),

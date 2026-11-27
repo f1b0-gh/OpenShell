@@ -2123,7 +2123,7 @@ pub async fn mint_persisted_authentication(
     let mut with_identity = sandbox.clone();
     state
         .compute
-        .prepare_ssh_identity(&mut with_identity, &mut authentication)
+        .prepare_launch_identity(&mut with_identity, &mut authentication)
         .await?;
     Ok(authentication)
 }

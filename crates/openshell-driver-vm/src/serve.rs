@@ -242,6 +242,7 @@ fn driver_config(
         upstream_proxy: settings.upstream_proxy,
         proxy_ca_bundle: settings.proxy_ca_bundle,
         ipv6_egress: settings.ipv6_egress,
+        provider_spiffe_workload_api_socket: settings.provider_spiffe_workload_api_socket,
         provider_spiffe_workload_api_tcp_endpoint: settings
             .provider_spiffe_workload_api_tcp_endpoint,
         provider_spiffe_allow_guest_tcp: settings.provider_spiffe_allow_guest_tcp,
@@ -311,6 +312,24 @@ mod tests {
         assert_eq!(built.grpc_endpoint, "https://host.test:9");
         assert_eq!(built.guest_tls_ca, Some("/gateway-ca.pem".into()));
         assert_eq!(built.supervisor_gateway_name.as_deref(), Some("gw"));
+    }
+
+    #[test]
+    fn the_host_workload_api_socket_reaches_the_driver() {
+        let gateway = GatewayContext {
+            gateway_port: Some(8080),
+            ..Default::default()
+        };
+        let built = config(
+            "provider_spiffe_workload_api_socket = \"/run/spire/agent.sock\"",
+            &gateway,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            built.provider_spiffe_workload_api_socket,
+            Some("/run/spire/agent.sock".into())
+        );
     }
 
     #[test]

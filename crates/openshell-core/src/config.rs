@@ -335,6 +335,14 @@ impl SpiffeBrokerConfig {
     }
 }
 
+/// Validate provider assertions from dedicated, platform-attested supervisors.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpiffeWorkloadIdentityConfig {
+    pub spiffe_id_prefix: String,
+    pub workload_api_socket_path: PathBuf,
+}
+
 /// Server configuration.
 ///
 /// Built programmatically in [`crate::Config::new`] and the gateway CLI from
@@ -419,6 +427,7 @@ pub struct Config {
     pub gateway_jwt: Option<GatewayJwtConfig>,
     /// Gateway-only access to SPIRE; shared supervisors receive access tokens.
     pub spiffe_broker: Option<SpiffeBrokerConfig>,
+    pub spiffe_workload_identity: Option<SpiffeWorkloadIdentityConfig>,
 
     /// Database URL for persistence.
     pub database_url: String,
@@ -1340,6 +1349,7 @@ impl Config {
             audit: GatewayAuditConfig::default(),
             gateway_jwt: None,
             spiffe_broker: None,
+            spiffe_workload_identity: None,
             database_url: String::new(),
             database_auth: DatabaseAuthMode::default(),
             database_max_connections: None,

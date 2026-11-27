@@ -71,8 +71,9 @@ pub struct VmSettings {
     /// supervisors.
     #[serde(flatten)]
     pub ipv6_egress: openshell_core::SupervisorIpv6EgressConfig,
-    /// Explicit guest-reachable SPIFFE Workload API TCP listener. VM guests
-    /// cannot receive a host UNIX socket, so this requires acknowledgement.
+    /// SPIFFE Workload API Unix socket used by host supervisors.
+    pub provider_spiffe_workload_api_socket: Option<PathBuf>,
+    /// Legacy guest TCP endpoint accepted for configuration compatibility.
     pub provider_spiffe_workload_api_tcp_endpoint: Option<String>,
     pub provider_spiffe_allow_guest_tcp: bool,
     /// Allow bind-mounting host directories into VM sandboxes.
@@ -143,6 +144,10 @@ impl VmSettings {
                 ));
             }
         }
+        if let Some(socket) = self.provider_spiffe_workload_api_socket.as_deref() {
+            openshell_core::driver_utils::validate_provider_spiffe_unix_socket(socket)
+                .map_err(ConfigError)?;
+        }
         if let Some(endpoint) = self.provider_spiffe_workload_api_tcp_endpoint.as_deref() {
             openshell_core::driver_utils::validate_guest_spiffe_tcp_endpoint(
                 endpoint,
@@ -177,6 +182,7 @@ impl Default for VmSettings {
             upstream_proxy: UpstreamProxyConfig::default(),
             proxy_ca_bundle: None,
             ipv6_egress: openshell_core::SupervisorIpv6EgressConfig::default(),
+            provider_spiffe_workload_api_socket: None,
             provider_spiffe_workload_api_tcp_endpoint: None,
             provider_spiffe_allow_guest_tcp: false,
             enable_bind_mounts: false,
@@ -296,6 +302,10 @@ impl VmSettings {
             self.proxy_ca_bundle = get("OPENSHELL_VM_UPSTREAM_PROXY_CA_BUNDLE").map(Into::into);
         }
 
+        if self.provider_spiffe_workload_api_socket.is_none() {
+            self.provider_spiffe_workload_api_socket =
+                get("OPENSHELL_VM_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET").map(Into::into);
+        }
         if self.provider_spiffe_workload_api_tcp_endpoint.is_none() {
             self.provider_spiffe_workload_api_tcp_endpoint =
                 get("OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_TCP_ENDPOINT");
@@ -541,6 +551,7 @@ mod tests {
             "bootstrap_extraction_max_bytes = 0",
             "rootfs_tar_staging_dir = \"\"",
             "proxy_ca_bundle = \"/ca.pem\"",
+            "provider_spiffe_workload_api_socket = \"tcp:127.0.0.1:8081\"",
             "provider_spiffe_allow_guest_tcp = true",
             "default_image = \"\"\nbootstrap_image = \"\"",
         ] {

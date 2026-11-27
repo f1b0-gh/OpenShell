@@ -1752,6 +1752,54 @@ The gateway verifies supervisor JWT-SVIDs with JWT bundles fetched from the
 SPIFFE Workload API, so this validation path does not require gateway access to
 the SPIRE OIDC discovery endpoint or its TLS CA.
 
+### Sandbox identity through the Workload API
+
+Enable `spiffe_workload_identity` to use a distinct SPIFFE ID for each
+sandbox's provider grants. Docker, Podman, and MicroVM support this mode when
+their supervisor Workload API Unix socket is configured. Use matching gateway,
+driver, and supervisor builds, and restart existing sandboxes after enabling
+the mode so they receive the identity in their launch bundle.
+
+```toml
+[openshell.gateway.spiffe_workload_identity]
+spiffe_id_prefix = "spiffe://example.org/openshell"
+workload_api_socket_path = "/run/spire/agent.sock"
+```
+
+Set a positive `ttl_secs` in the existing `[openshell.gateway.gateway_jwt]`
+table. The gateway socket must be an absolute Unix socket path in the gateway's
+filesystem. The gateway uses it to read the JWT trust bundle. For
+`token_exchange`, it also uses the socket to fetch its own JWT-SVID for the
+intermediate exchange. Configure only one of `spiffe_workload_identity` and
+`spiffe_broker`. Use the Broker API mode for shared Kubernetes supervisors.
+
+Set `provider_spiffe_workload_api_socket` to an absolute Unix socket path in
+the selected driver table. Docker and Podman project the socket into the
+dedicated supervisor. MicroVM connects from its host supervisor to the
+socket on the driver host. Podman's TCP endpoints serve direct supervisor
+exchanges. The supervisor must reach the gateway over HTTPS or direct HTTP to
+a loopback IP address. `openshell gateway info` lists
+`openshell.compute.provider-workload-identity` when the driver supplies a Unix
+socket.
+
+For every sandbox, register the identity
+`<spiffe_id_prefix>/gateway/<gateway-id>/sandbox/<sandbox-id>` with the Workload
+API issuer. Use `gateway_jwt.gateway_id` and the sandbox's OpenShell ID. The
+issuer must attest the current supervisor launch using attributes controlled
+by the trusted host or runtime. On rootless Podman, a user who controls the
+engine can copy labels to another container. Scope registrations to trusted
+engine and launch attributes. When a launch is replaced, update any
+launch-specific registrations.
+
+The supervisor requests two JWT-SVIDs for the same exact SPIFFE ID. The OAuth
+assertion has the provider as its sole audience. The launch assertion has
+`urn:openshell:provider-grants:launch:<generation>` as its sole audience. The
+gateway verifies both signatures, subjects, audiences, and expiries and checks
+the active sandbox session and provider attachment. It exchanges the OAuth
+assertion for an access token and returns it to the supervisor for injection
+into matching requests. See
+[Dynamic Token Grants](/how-it-works/providers/profiles#dynamic-token-grants).
+
 ### Sandbox identity through the SPIFFE Broker API
 
 For shared-supervisor Kubernetes sandboxes, the gateway can obtain sandbox
@@ -2221,11 +2269,9 @@ overlay_disk_mib = 4096
 # see IPv6 Egress and NAT64.
 # policy_dns_ipv6_egress    = "auto"
 # nat64_prefixes            = ["2001:db8:64::/96"]
-# VM guests cannot mount a host Workload API Unix socket. Configure only a
-# separately operated guest-reachable TCP listener and explicitly acknowledge
-# the exposure; host-only sockets are never exposed automatically.
-# provider_spiffe_workload_api_tcp_endpoint = "tcp:192.0.2.10:8081"
-# provider_spiffe_allow_guest_tcp = true
+# Optional Workload API Unix socket on the VM driver host. The host
+# supervisor uses this path for provider grants.
+# provider_spiffe_workload_api_socket = "/run/spire/agent.sock"
 # Unsafe operator override. Host bind mounts expose gateway-host paths inside
 # VM sandboxes and can negate OpenShell isolation and filesystem controls.
 # Requires allow_driver_config = true and
@@ -2257,6 +2303,10 @@ externally managed `vm` socket owned by another user, the driver cannot read the
 gateway's staging directory and rootfs tar sources fail with a
 `FAILED_PRECONDITION` error; use a registry image reference instead.
 
+The legacy `provider_spiffe_workload_api_tcp_endpoint` and
+`provider_spiffe_allow_guest_tcp` settings are inactive. Use
+`provider_spiffe_workload_api_socket` on the VM driver host for provider grants.
+
 ### Extension Driver
 
 Extension drivers run outside the gateway and expose the
@@ -2277,6 +2327,13 @@ compute_driver = "kyma"
 [openshell.drivers.kyma]
 socket_path = "/run/openshell/kyma-compute-driver.sock"
 ```
+
+An extension driver can opt into per-sandbox SPIFFE provider grants by staging
+a trusted Workload API Unix socket and the gateway's launch bundle for a
+compatible dedicated supervisor. Advertise
+`openshell.compute.provider-workload-identity` when the operator has configured
+this setup. See
+[Sandbox identity through the Workload API](#sandbox-identity-through-the-workload-api).
 
 ## Preflight package configuration {#gateway-config-preflight}
 

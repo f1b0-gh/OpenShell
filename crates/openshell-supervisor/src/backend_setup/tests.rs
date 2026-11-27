@@ -158,6 +158,7 @@ impl TestSetup {
                 gateway_expires_at: 0,
                 sandbox_token: SecretJwt::parse("test-sandbox-token").unwrap(),
                 sandbox_expires_at: i64::MAX,
+                provider_spiffe_id: None,
                 ssh_host_private_key: None,
                 traces_otlp_headers: None,
                 ocsf_otlp_headers: None,

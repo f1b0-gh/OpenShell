@@ -251,8 +251,10 @@ mod tests {
     // and the public/durable overlap remain unchanged.
     // The service backend HTTP version is part of both schemas. Legacy
     // endpoint records omit it and continue to use HTTP/1.1.
+    // Provider access token requests accept two optional supervisor SVIDs.
+    // The fields are public-only and older requests still omit them.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "edfc80ad192e77e1a9d1e1d6e3342280e4438f8bf7cb49969f580060df9a056a";
+        "7e0830b5850c3fde8deb4ae9b1ff05c83a52bf9b8615e5a0c5020ee86e3727fb";
     // The storage.v2 refresh root adds retired handles and the first mint's
     // provider revision. All fields from the prior root retain their wire tags.
     const DURABLE_SCHEMA_SHA256: &str =

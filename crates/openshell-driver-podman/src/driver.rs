@@ -15,6 +15,9 @@ use openshell_core::driver_utils::{
     SANDBOX_RUNTIME_IMAGE_BINARY_PATH, extract_first_tar_entry, supervisor_image_should_refresh,
     temp_extract_container_name, validate_linux_elf_binary, write_cache_binary_atomic,
 };
+use openshell_core::extension_protocol::{
+    COMPUTE_PROVIDER_WORKLOAD_IDENTITY, ExtensionFamily, capabilities_if, extension_metadata,
+};
 use openshell_core::gpu::{
     CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
     effective_driver_gpu_count, validate_cdi_gpu_device_request,
@@ -747,11 +750,17 @@ impl PodmanComputeDriver {
             }),
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
-            extension: Some(openshell_core::extension_protocol::extension_metadata(
-                openshell_core::extension_protocol::ExtensionFamily::Compute,
+            extension: Some(extension_metadata(
+                ExtensionFamily::Compute,
                 "openshell/podman",
                 openshell_core::VERSION,
-                [],
+                capabilities_if(
+                    COMPUTE_PROVIDER_WORKLOAD_IDENTITY,
+                    self.config
+                        .provider_spiffe_workload_api_socket
+                        .as_deref()
+                        .is_some_and(Path::is_absolute),
+                ),
             )),
         })
     }
@@ -1251,7 +1260,7 @@ impl PodmanComputeDriver {
         }
 
         // Create the workspace volume and per-sandbox runtime files. During a
-        // stopped trust replacement, retain the named resources belonging to
+        // stopped supervisor replacement, retain the named resources belonging to
         // the old pair and reuse its resolver/token secrets.
         let (
             resolver_secret_name,
@@ -1281,7 +1290,8 @@ impl PodmanComputeDriver {
                         .map_err(ComputeDriverError::from)?
                     {
                         return Err(ComputeDriverError::Precondition(
-                            "Podman trust replacement requires the existing resolver secret".into(),
+                            "Podman supervisor replacement requires the existing resolver secret"
+                                .into(),
                         ));
                     }
                     false
@@ -1363,7 +1373,7 @@ impl PodmanComputeDriver {
         .await?;
 
         // Clean up the volume and per-sandbox secrets on any failure past this
-        // point. Resources retained for a stopped trust replacement are left
+        // point. Resources retained for a stopped supervisor replacement are left
         // intact so the rollback path can restore the old pair.
         let channel_owned = std::sync::atomic::AtomicBool::new(false);
         let control_owned = std::sync::atomic::AtomicBool::new(false);
@@ -1445,7 +1455,7 @@ impl PodmanComputeDriver {
                             .map_err(ComputeDriverError::from)?
                         {
                             return Err(ComputeDriverError::Precondition(
-                                "Podman trust replacement requires the existing TLS CA secret"
+                                "Podman supervisor replacement requires the existing TLS CA secret"
                                     .into(),
                             ));
                         }
@@ -1513,7 +1523,7 @@ impl PodmanComputeDriver {
                             .await?;
                         control_owned.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
-                    // Supervisor-only trust reconciliation reuses the stopped
+                    // Supervisor-only reconciliation reuses the stopped
                     // workload container together with its volumes, secrets,
                     // and workspace data. Only the supervisor is replaced.
                     let workload_id = if let Some(existing) = existing_workload_container_id {
@@ -1587,7 +1597,12 @@ impl PodmanComputeDriver {
                     // bootstrap material exist. It keeps the agent stopped
                     // until the authenticated supervisor confirms the boundary.
                     self.client.start_container(&workload_id).await?;
-                    self.client.start_container(&supervisor_id).await?;
+                    if let Err(error) = self.client.start_container(&supervisor_id).await {
+                        if existing_workload_container_id.is_some() {
+                            let _ = self.client.stop_container(&workload_id, 0).await;
+                        }
+                        return Err(error.into());
+                    }
                     Ok::<(), ComputeDriverError>(())
                 }
                 .await;
@@ -1849,38 +1864,44 @@ impl PodmanComputeDriver {
         span_status.finish(result)
     }
 
-    /// Whether the trusted supervisor of a sandbox predates the gateway's
-    /// current destination-trust bundle. A missing supervisor or a missing
-    /// generation label (a supervisor created before this labeling existed)
-    /// counts as stale: only the supervisor is recreated to refresh it, never
-    /// the workload or its data.
-    async fn supervisor_network_trust_stale(
+    /// Compare the supervisor's SPIFFE settings and any requested trust
+    /// generation with the current launch.
+    async fn supervisor_configuration_stale(
         &self,
         sandbox_id: &str,
+        requires_provider_spiffe_id: bool,
+        expected_trust_generation: Option<&str>,
     ) -> Result<bool, ComputeDriverError> {
         let supervisor = crate::isolation::supervisor_name(sandbox_id);
         match self.client.inspect_container(&supervisor).await {
-            Ok(inspect) => Ok(inspect
-                .config
-                .labels
-                .get(NETWORK_SUPERVISOR_TRUST_GENERATION_KEY)
-                .map(String::as_str)
-                != Some(self.expected_network_trust_generation())),
-            Err(PodmanApiError::NotFound(_)) => Ok(true),
+            Ok(inspect) => Ok(expected_trust_generation.is_some_and(|expected| {
+                inspect
+                    .config
+                    .labels
+                    .get(NETWORK_SUPERVISOR_TRUST_GENERATION_KEY)
+                    .map(String::as_str)
+                    != Some(expected)
+            }) || !container::provider_spiffe_configuration_matches(
+                &self.config,
+                &inspect,
+                requires_provider_spiffe_id,
+            )),
+            Err(PodmanApiError::NotFound(_)) => {
+                Ok(expected_trust_generation.is_some() || requires_provider_spiffe_id)
+            }
             Err(error) => Err(error.into()),
         }
     }
 
-    /// Recreate only the trusted supervisor of a stopped pair so the start
-    /// picks up the gateway's current destination-trust bundle. The workload
-    /// container, its volumes, its secrets, and its workspace data are never
-    /// replaced: the additional CA bundle is mounted only into the supervisor.
-    async fn replace_supervisor_for_network_trust(
+    /// Recreate the trusted supervisor of a stopped pair with the current
+    /// operator configuration. Reuse the workload container and its resources.
+    async fn replace_stopped_supervisor(
         &self,
         old_workload: &ContainerListEntry,
         durable_sandbox: &DriverSandbox,
         generation: &openshell_core::sandbox_generation::SandboxGenerationId,
         encoded_authentication: &[u8],
+        stop_running_supervisor: bool,
     ) -> Result<(), ComputeDriverError> {
         if durable_sandbox.id
             != old_workload
@@ -1894,13 +1915,12 @@ impl PodmanComputeDriver {
         }
         if durable_sandbox.name.is_empty() || durable_sandbox.spec.is_none() {
             return Err(ComputeDriverError::Precondition(
-                "a durable sandbox provisioning snapshot is required for Podman supervisor trust reconciliation".into(),
+                "a durable sandbox provisioning snapshot is required to replace a Podman supervisor".into(),
             ));
         }
         if encoded_authentication.is_empty() {
             return Err(ComputeDriverError::Precondition(
-                "fresh launch authentication is required for Podman supervisor trust reconciliation"
-                    .into(),
+                "fresh launch authentication is required to replace a Podman supervisor".into(),
             ));
         }
         // Validate all untrusted fields before changing the old supervisor.
@@ -1910,10 +1930,17 @@ impl PodmanComputeDriver {
 
         let canonical_supervisor = crate::isolation::supervisor_name(&durable_sandbox.id);
         let previous_supervisor = match self.client.inspect_container(&canonical_supervisor).await {
+            Ok(inspect) if inspect.state.running && stop_running_supervisor => {
+                self.client
+                    .stop_container(&inspect.id, self.config.stop_timeout_secs)
+                    .await?;
+                self.wait_for_container_stopped(&durable_sandbox.id, &inspect.id)
+                    .await?;
+                Some(inspect.id)
+            }
             Ok(inspect) if inspect.state.running => {
                 return Err(ComputeDriverError::Precondition(
-                    "refusing to replace a running Podman supervisor during trust reconciliation"
-                        .into(),
+                    "refusing to replace a running Podman supervisor".into(),
                 ));
             }
             Ok(inspect) => Some(inspect.id),
@@ -1976,10 +2003,10 @@ impl PodmanComputeDriver {
                     rollback_container = %supervisor_rollback_name,
                     sandbox_id = %durable_sandbox.id,
                     restore_error = %restore_error,
-                    "failed to restore the previous Podman supervisor after a failed trust refresh"
+                    "failed to restore the previous Podman supervisor after a failed replacement"
                 );
                 return Err(ComputeDriverError::Message(format!(
-                    "trust refresh failed and the previous supervisor could not be \
+                    "replacement failed and the previous supervisor could not be \
                      restored; the retained supervisor is named '{supervisor_rollback_name}' \
                      and can be removed manually: {restore_error}"
                 )));
@@ -2002,10 +2029,10 @@ impl PodmanComputeDriver {
                 rollback_container = %supervisor_rollback_name,
                 sandbox_id = %durable_sandbox.id,
                 remove_error = %error,
-                "failed to remove the previous Podman supervisor after a trust refresh"
+                "failed to remove the previous Podman supervisor after a replacement"
             );
             return Err(ComputeDriverError::Message(format!(
-                "trust refresh succeeded but the previous supervisor could not be \
+                "replacement succeeded but the previous supervisor could not be \
                  removed; the orphaned supervisor is named '{supervisor_rollback_name}' \
                  and can be removed manually: {error}"
             )));
@@ -2042,6 +2069,9 @@ impl PodmanComputeDriver {
         let launch_authentication = (!encoded_authentication.is_empty())
             .then(|| decode_launch_authentication(encoded_authentication))
             .transpose()?;
+        let requires_provider_spiffe_id = launch_authentication
+            .as_ref()
+            .is_some_and(|authentication| authentication.supervisor.provider_spiffe_id.is_some());
         let container = self
             .find_container(sandbox_id)
             .await?
@@ -2081,28 +2111,34 @@ impl PodmanComputeDriver {
                 // in-memory launch session changes atomically on both sides.
             }
             self.client.stop_container(&container.id, 0).await?;
-            self.wait_for_container_stopped(sandbox_id, &container.id)
+            let finished_at = self
+                .wait_for_container_stopped(sandbox_id, &container.id)
                 .await?;
+            self.lifecycle_event_fences
+                .record_previous_exit(sandbox_id, finished_at.as_deref());
         }
-        // A user-driven start of a stopped sandbox mints fresh launch
-        // credentials. When the trusted supervisor predates the gateway's
-        // current destination-trust bundle (including supervisors created
-        // before generation labels existed), recreate only the supervisor so
-        // stop/start picks up the current additional CA bundle. The workload
-        // container, its volumes, and its workspace data are never replaced.
-        // Recovery without fresh credentials and running sandboxes keep their
-        // existing supervisor and bundle unchanged.
-        if !workload_running
-            && launch_authentication.is_some()
+        // Reconcile SPIFFE projection on both restart paths, including after
+        // an operator removes it. Refresh trust on stop/start and when
+        // recovering a supervisor that will receive verified launch identity.
+        let expected_trust_generation = (!workload_running || requires_provider_spiffe_id)
+            .then(|| self.expected_network_trust_generation());
+        if launch_authentication.is_some()
             && let Some(durable_sandbox) = durable_sandbox
-            && self.supervisor_network_trust_stale(sandbox_id).await?
+            && self
+                .supervisor_configuration_stale(
+                    sandbox_id,
+                    requires_provider_spiffe_id,
+                    expected_trust_generation,
+                )
+                .await?
         {
             let result = self
-                .replace_supervisor_for_network_trust(
+                .replace_stopped_supervisor(
                     &container,
                     durable_sandbox,
                     &generation,
                     encoded_authentication,
+                    workload_running,
                 )
                 .await;
             return span_status.finish(result);
@@ -2704,6 +2740,7 @@ mod tests {
                 gateway_expires_at: i64::MAX,
                 sandbox_token: SecretJwt::parse("sandbox.token.value").unwrap(),
                 sandbox_expires_at: i64::MAX,
+                provider_spiffe_id: None,
                 ssh_host_private_key: None,
                 traces_otlp_headers: None,
                 ocsf_otlp_headers: None,
@@ -2883,7 +2920,7 @@ mod tests {
         let driver = test_driver(socket);
         let (old_workload, durable, generation) = refresh_fixture("prep-1");
         let result = driver
-            .replace_supervisor_for_network_trust(&old_workload, &durable, &generation, b"auth")
+            .replace_stopped_supervisor(&old_workload, &durable, &generation, b"auth", false)
             .await;
         assert!(
             result.is_err(),
@@ -2918,7 +2955,7 @@ mod tests {
         let driver = test_driver(socket);
         let (old_workload, durable, generation) = refresh_fixture("restore-1");
         let result = driver
-            .replace_supervisor_for_network_trust(&old_workload, &durable, &generation, b"auth")
+            .replace_stopped_supervisor(&old_workload, &durable, &generation, b"auth", false)
             .await;
         assert!(result.is_err(), "failed replacement must fail the refresh");
         handle.await.unwrap();
@@ -2973,7 +3010,7 @@ mod tests {
         let driver = test_driver(socket);
         let (old_workload, durable, generation) = refresh_fixture("orphan-1");
         let error = driver
-            .replace_supervisor_for_network_trust(&old_workload, &durable, &generation, b"auth")
+            .replace_stopped_supervisor(&old_workload, &durable, &generation, b"auth", false)
             .await
             .expect_err("restore failure must fail the refresh");
         handle.await.unwrap();

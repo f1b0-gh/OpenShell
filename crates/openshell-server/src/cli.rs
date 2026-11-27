@@ -836,6 +836,9 @@ fn prepare_server_config_with_drivers(
     config.spiffe_broker = file
         .as_ref()
         .and_then(|file| file.openshell.gateway.spiffe_broker.clone());
+    config.spiffe_workload_identity = file
+        .as_ref()
+        .and_then(|file| file.openshell.gateway.spiffe_workload_identity.clone());
 
     if let Some(kubernetes) = file
         .as_ref()
@@ -1438,6 +1441,12 @@ fn validate_preflight_semantics(
     file: &ConfigFile,
 ) -> Result<()> {
     let gateway = &file.openshell.gateway;
+    crate::spiffe_broker::SupervisorWorkloadIdentity::from_settings(
+        gateway.spiffe_workload_identity.as_ref(),
+        gateway.gateway_jwt.as_ref(),
+        gateway.spiffe_broker.is_some(),
+    )
+    .map_err(|error| miette::miette!("{error}"))?;
     validate_grpc_rate_limit_args(
         args.grpc_rate_limit_requests,
         args.grpc_rate_limit_window_seconds,
@@ -3308,6 +3317,10 @@ mod tests {
             (
                 "middleware",
                 "[openshell]\nversion = 2\n[[openshell.supervisor.middleware]]\nname = 'guard'\ngrpc_endpoint = 'http://127.0.0.1:50051'\nallow_insecure_transport = true\nmax_payload_bytes = 1024\ntimeout = 'invalid'\n",
+            ),
+            (
+                "provider-workload-identity-without-expiring-session",
+                "[openshell]\nversion = 2\n[openshell.gateway.spiffe_workload_identity]\nspiffe_id_prefix = 'spiffe://example.org/openshell'\nworkload_api_socket_path = '/run/spire/agent.sock'\n",
             ),
         ];
 

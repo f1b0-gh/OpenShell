@@ -196,14 +196,18 @@ struct Args {
     )]
     nat64_prefixes: Vec<String>,
 
-    /// Guest-reachable SPIFFE Workload API endpoint (`tcp:IP:port`).
+    /// Host Unix socket for SPIFFE provider token grants.
+    #[arg(long, env = "OPENSHELL_VM_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET")]
+    provider_spiffe_workload_api_socket: Option<PathBuf>,
+
+    /// Legacy SPIFFE guest TCP setting accepted for compatibility.
     #[arg(
         long = "provider-spiffe-workload-api-tcp-endpoint",
         env = "OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_TCP_ENDPOINT"
     )]
     provider_spiffe_workload_api_tcp_endpoint: Option<String>,
 
-    /// Explicit acknowledgement that the configured Workload API listener is exposed to VM guests.
+    /// Acknowledgement for the legacy SPIFFE guest TCP setting.
     #[arg(
         long,
         env = "OPENSHELL_PROVIDER_SPIFFE_ALLOW_GUEST_TCP",
@@ -382,6 +386,7 @@ async fn main() -> Result<()> {
             policy_dns_ipv6_egress: args.policy_dns_ipv6_egress,
             nat64_prefixes: args.nat64_prefixes.clone(),
         },
+        provider_spiffe_workload_api_socket: args.provider_spiffe_workload_api_socket,
         provider_spiffe_workload_api_tcp_endpoint: args
             .provider_spiffe_workload_api_tcp_endpoint
             .clone(),

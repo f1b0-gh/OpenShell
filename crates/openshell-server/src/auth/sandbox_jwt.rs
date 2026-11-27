@@ -264,6 +264,7 @@ impl SandboxSessionJwtAuthority {
                 gateway_expires_at: pair.gateway.expires_at,
                 sandbox_token: pair.sandbox.token,
                 sandbox_expires_at: pair.sandbox.expires_at,
+                provider_spiffe_id: None,
                 ssh_host_private_key: None,
                 traces_otlp_headers: None,
                 ocsf_otlp_headers: None,
