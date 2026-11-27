@@ -9099,6 +9099,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_image_identity_preserves_overlay_and_config_precedence() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let source = directory.path().join("image-source");
+        std::fs::create_dir_all(source.join("image-rootfs/etc")).unwrap();
+        std::fs::write(
+            source.join("image-rootfs/etc/passwd"),
+            "sandbox:x:10001:10002:Sandbox:/sandbox:/bin/sh\n",
+        )
+        .unwrap();
+        let image = directory.path().join("prepared.ext4");
+        create_ext4_image_from_dir_with_size(&source, &image, 32 * 1024 * 1024).unwrap();
+
+        for (name, configured, marker, upper, expected, write_marker) in [
+            ("fresh", false, false, false, (10001, 10002), true),
+            ("configured", true, false, false, (2000, 3000), true),
+            ("persisted-marker", true, true, false, (4242, 4343), false),
+            ("persisted-upper", true, false, true, (4242, 4343), true),
+        ] {
+            let state = directory.path().join(name);
+            std::fs::create_dir_all(&state).unwrap();
+            let overlay = state.join(SANDBOX_OVERLAY_IMAGE);
+            if marker {
+                write_sandbox_owner_state(
+                    &state,
+                    SandboxOwnerIdentity {
+                        uid: 4242,
+                        gid: 4343,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            if upper {
+                let overlay_source = state.join("overlay-source");
+                std::fs::create_dir_all(overlay_source.join("upper/etc")).unwrap();
+                std::fs::write(
+                    overlay_source.join("upper/etc/passwd"),
+                    "sandbox:x:4242:4343:Sandbox:/sandbox:/bin/sh\n",
+                )
+                .unwrap();
+                create_ext4_image_from_dir_with_size(&overlay_source, &overlay, 32 * 1024 * 1024)
+                    .unwrap();
+            }
+            let config = VmDriverConfig {
+                state_dir: directory.path().to_path_buf(),
+                sandbox_uid: configured.then_some(2000),
+                sandbox_gid: configured.then_some(3000),
+                ..Default::default()
+            };
+            let preparation = if marker || upper {
+                OverlayPreparation::PreserveExisting
+            } else {
+                OverlayPreparation::Fresh
+            };
+            let (identity, actual_write_marker) =
+                sandbox_owner_state_for_launch(&state, &overlay, &image, &config, preparation)
+                    .await
+                    .unwrap();
+
+            assert_eq!((identity.uid, identity.gid), expected, "{name}");
+            assert_eq!(actual_write_marker, write_marker, "{name}");
+        }
+    }
+
+    #[tokio::test]
     async fn fresh_overlay_uses_explicit_identity_without_image_inspection() {
         let dir = unique_temp_dir();
         std::fs::create_dir_all(&dir).unwrap();

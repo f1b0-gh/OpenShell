@@ -1494,6 +1494,94 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_guest_user_ids_from_image_selects_guest_layout() {
+        for (name, prepared, legacy_passwd, image_passwd, expected) in [
+            (
+                "prepared",
+                true,
+                None,
+                Some("sandbox:x:10001:10002:Sandbox:/sandbox:/bin/sh\n"),
+                Some((10001, 10002)),
+            ),
+            (
+                "legacy",
+                false,
+                Some("sandbox:x:4242:4343:Sandbox:/sandbox:/bin/sh\n"),
+                None,
+                Some((4242, 4343)),
+            ),
+            (
+                "prepared-with-bootstrap-account",
+                true,
+                Some("sandbox:x:1000:1000:Sandbox:/sandbox:/bin/sh\n"),
+                Some("sandbox:x:10001:10002:Sandbox:/sandbox:/bin/sh\n"),
+                Some((10001, 10002)),
+            ),
+            (
+                "prepared-without-sandbox-account",
+                true,
+                Some("sandbox:x:1000:1000:Sandbox:/sandbox:/bin/sh\n"),
+                Some("root:x:0:0:root:/root:/bin/sh\n"),
+                None,
+            ),
+            (
+                "prepared-without-passwd",
+                true,
+                Some("sandbox:x:1000:1000:Sandbox:/sandbox:/bin/sh\n"),
+                None,
+                None,
+            ),
+            ("legacy-without-passwd", false, None, None, None),
+        ] {
+            let directory = tempfile::tempdir().expect("fixture directory");
+            let source = directory.path().join("source");
+            fs::create_dir_all(&source).expect("create source");
+            if prepared {
+                fs::create_dir_all(source.join("image-rootfs")).expect("create image rootfs");
+            }
+            for (path, passwd) in [("etc", legacy_passwd), ("image-rootfs/etc", image_passwd)] {
+                if let Some(passwd) = passwd {
+                    let etc = source.join(path);
+                    fs::create_dir_all(&etc).expect("create etc");
+                    fs::write(etc.join("passwd"), passwd).expect("write passwd");
+                }
+            }
+            let image = directory.path().join("rootfs.ext4");
+            create_ext4_image_from_dir_with_size(&source, &image, 32 * 1024 * 1024)
+                .expect("create ext4 fixture");
+
+            assert_eq!(
+                sandbox_guest_user_ids_from_image(&image).expect("read image account"),
+                expected,
+                "{name}",
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_guest_user_ids_from_image_rejects_malformed_prepared_account() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let source = directory.path().join("source");
+        fs::create_dir_all(source.join("image-rootfs/etc")).expect("create image etc");
+        fs::create_dir_all(source.join("etc")).expect("create bootstrap etc");
+        fs::write(
+            source.join("image-rootfs/etc/passwd"),
+            "sandbox:x:invalid:10002:Sandbox:/sandbox:/bin/sh\n",
+        )
+        .expect("write malformed image account");
+        fs::write(
+            source.join("etc/passwd"),
+            "sandbox:x:1000:1000:Sandbox:/sandbox:/bin/sh\n",
+        )
+        .expect("write bootstrap account");
+        let image = directory.path().join("rootfs.ext4");
+        create_ext4_image_from_dir_with_size(&source, &image, 32 * 1024 * 1024)
+            .expect("create ext4 fixture");
+
+        assert!(sandbox_guest_user_ids_from_image(&image).is_err());
+    }
+
+    #[test]
     fn sandbox_guest_user_ids_reads_existing_sandbox_user() {
         let dir = unique_temp_dir();
         let rootfs = dir.join("rootfs");
