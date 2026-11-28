@@ -238,6 +238,16 @@ the overlay while cached image disks remain unchanged. The overlay disk must be
 large enough to hold the compressed payload, unpacked rootfs, and sandbox writes
 during the first prepare.
 
+For a fresh overlay, explicit `sandbox_uid` and `sandbox_gid` settings take
+precedence. Otherwise, the driver reads the sandbox account from
+`/image-rootfs/etc/passwd` on prepared image disks, or `/etc/passwd` on legacy
+and bootstrap disks. A prepared disk's outer account file does not describe
+the workload identity. Existing overlays retain their recorded identity or
+recover it from their upper layer. Lower-image recovery for unmarked and v1
+overlays keeps the historical `/etc/passwd` lookup and UID/GID 1000 fallback,
+even if a prepared disk contains a different nested account. This fix does
+not migrate existing files to another owner.
+
 The driver also writes the accepted `DriverSandbox` launch request to
 `<state-dir>/sandboxes/<id>/sandbox.pb`. If the gateway restarts, it starts a
 new VM driver process. During graceful shutdown, the gateway first sends the

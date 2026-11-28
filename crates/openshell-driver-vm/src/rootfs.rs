@@ -802,12 +802,28 @@ fn debugfs_quote_argument(argument: &str) -> Option<String> {
     Some(quoted)
 }
 
-/// Read the sandbox account identity directly from an ext4 rootfs image.
+/// Read the workload account identity for a fresh overlay from an ext4 image.
 ///
-/// Persisted VM overlays may outlive the prepared-image cache layout that
-/// created them. Reading the matching old lower disk lets the driver preserve
-/// that overlay's real ownership contract during an upgrade.
+/// Prepared disks wrap the workload rootfs in `/image-rootfs`; bootstrap and legacy disks
+/// place it at the image root. Select the layout before reading the account so
+/// a missing prepared account cannot fall back to an outer bootstrap account.
 pub fn sandbox_guest_user_ids_from_image(image_path: &Path) -> Result<Option<(u32, u32)>, String> {
+    let passwd_path = if ext4_image_has_directory(image_path, "/image-rootfs")? {
+        "/image-rootfs/etc/passwd"
+    } else {
+        "/etc/passwd"
+    };
+    sandbox_guest_user_ids_from_image_path(image_path, passwd_path)
+}
+
+/// Preserve the lower-image lookup used when existing overlays were created.
+///
+/// Older drivers read only `/etc/passwd`, even on prepared disks. Selecting a
+/// nested account now could silently change an unmarked or v1 overlay's owner.
+/// A missing account retains the caller's historical default identity.
+pub fn sandbox_guest_user_ids_from_legacy_image(
+    image_path: &Path,
+) -> Result<Option<(u32, u32)>, String> {
     sandbox_guest_user_ids_from_image_path(image_path, "/etc/passwd")
 }
 
@@ -1491,6 +1507,94 @@ mod tests {
         assert!(ext4_image_has_directory(&not_ext4, "/image-rootfs").is_err());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sandbox_guest_user_ids_from_image_selects_guest_layout() {
+        for (name, prepared, legacy_passwd, image_passwd, expected) in [
+            (
+                "prepared",
+                true,
+                None,
+                Some("sandbox:x:10001:10002:Sandbox:/sandbox:/bin/sh\n"),
+                Some((10001, 10002)),
+            ),
+            (
+                "legacy",
+                false,
+                Some("sandbox:x:4242:4343:Sandbox:/sandbox:/bin/sh\n"),
+                None,
+                Some((4242, 4343)),
+            ),
+            (
+                "prepared-with-bootstrap-account",
+                true,
+                Some("sandbox:x:1000:1000:Sandbox:/sandbox:/bin/sh\n"),
+                Some("sandbox:x:10001:10002:Sandbox:/sandbox:/bin/sh\n"),
+                Some((10001, 10002)),
+            ),
+            (
+                "prepared-without-sandbox-account",
+                true,
+                Some("sandbox:x:1000:1000:Sandbox:/sandbox:/bin/sh\n"),
+                Some("root:x:0:0:root:/root:/bin/sh\n"),
+                None,
+            ),
+            (
+                "prepared-without-passwd",
+                true,
+                Some("sandbox:x:1000:1000:Sandbox:/sandbox:/bin/sh\n"),
+                None,
+                None,
+            ),
+            ("legacy-without-passwd", false, None, None, None),
+        ] {
+            let directory = tempfile::tempdir().expect("fixture directory");
+            let source = directory.path().join("source");
+            fs::create_dir_all(&source).expect("create source");
+            if prepared {
+                fs::create_dir_all(source.join("image-rootfs")).expect("create image rootfs");
+            }
+            for (path, passwd) in [("etc", legacy_passwd), ("image-rootfs/etc", image_passwd)] {
+                if let Some(passwd) = passwd {
+                    let etc = source.join(path);
+                    fs::create_dir_all(&etc).expect("create etc");
+                    fs::write(etc.join("passwd"), passwd).expect("write passwd");
+                }
+            }
+            let image = directory.path().join("rootfs.ext4");
+            create_ext4_image_from_dir_with_size(&source, &image, 32 * 1024 * 1024)
+                .expect("create ext4 fixture");
+
+            assert_eq!(
+                sandbox_guest_user_ids_from_image(&image).expect("read image account"),
+                expected,
+                "{name}",
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_guest_user_ids_from_image_rejects_malformed_prepared_account() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let source = directory.path().join("source");
+        fs::create_dir_all(source.join("image-rootfs/etc")).expect("create image etc");
+        fs::create_dir_all(source.join("etc")).expect("create bootstrap etc");
+        fs::write(
+            source.join("image-rootfs/etc/passwd"),
+            "sandbox:x:invalid:10002:Sandbox:/sandbox:/bin/sh\n",
+        )
+        .expect("write malformed image account");
+        fs::write(
+            source.join("etc/passwd"),
+            "sandbox:x:1000:1000:Sandbox:/sandbox:/bin/sh\n",
+        )
+        .expect("write bootstrap account");
+        let image = directory.path().join("rootfs.ext4");
+        create_ext4_image_from_dir_with_size(&source, &image, 32 * 1024 * 1024)
+            .expect("create ext4 fixture");
+
+        assert!(sandbox_guest_user_ids_from_image(&image).is_err());
     }
 
     #[test]
